@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -19,8 +19,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	devinauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/devin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -35,14 +35,9 @@ const (
 	// DevinDefaultBaseURL is the default upstream Codeium/Devin endpoint.
 	DevinDefaultBaseURL = "https://server.codeium.com"
 	// DevinChatPath is the Connect-RPC endpoint for chat completions.
-	DevinChatPath = "/exa.api_server_pb.ApiServerService/GetChatMessage"
-
-	// DevinDefaultClientName is the client identifier declared in metadata.
-	DevinDefaultClientName = "chisel"
-	// DevinDefaultClientVersion is the client version declared in metadata.
-	DevinDefaultClientVersion = "3000.10.21"
-	// DevinFingerprintHexLen is the mandatory 732-hex-character length for metadata #31.
-	DevinFingerprintHexLen = 732
+	DevinChatPath        = "/exa.api_server_pb.ApiServerService/GetChatMessage"
+	DevinAssignModelPath = "/exa.api_server_pb.ApiServerService/AssignModel"
+	DevinAuthPath        = "/exa.auth_pb.AuthService/GetUserJwt"
 
 	// DevinDefaultMaxTokens is the fallback max completion tokens.
 	DevinDefaultMaxTokens = 128000
@@ -56,6 +51,7 @@ type DevinTool struct {
 	Name        string
 	Description string
 	Parameters  []byte
+	Strict      bool
 }
 
 // DevinToolCall represents a tool call in a ChatMessagePrompt.
@@ -67,10 +63,12 @@ type DevinToolCall struct {
 
 // DevinToolCallDelta represents a streaming tool call chunk from response Field 6.
 type DevinToolCallDelta struct {
-	ID        string
-	Name      string
-	Arguments string
-	Index     int
+	ID               string
+	Name             string
+	Arguments        string
+	InvalidJSON      string
+	InvalidJSONError string
+	IsCustom         bool
 }
 
 // DevinImage represents an image attachment in a DevinPrompt (Prompt #10).
@@ -87,60 +85,92 @@ type DevinPrompt struct {
 	Images        []DevinImage
 	ToolCalls     []DevinToolCall
 	ToolCallID    string // For source=4 (tool result)
+	ToolResultErr bool
 	Thinking      string
 	Signature     []byte
 	SignatureType string
 }
 
+type DevinCompletionConfig struct {
+	MaxTokens        int
+	MaxNewlines      int
+	Temperature      *float64
+	FirstTemperature *float64
+	TopK             int
+	TopP             *float64
+	StopPatterns     []string
+}
+
+type DevinToolChoice struct {
+	OptionName string
+	ToolName   string
+}
+
+type DevinChatRequest struct {
+	SessionToken             string
+	UserJWT                  string
+	DeviceSeed               string
+	ChatModelUID             string
+	SystemPrompt             string
+	Prompts                  []DevinPrompt
+	Tools                    []DevinTool
+	Completion               DevinCompletionConfig
+	ToolChoice               DevinToolChoice
+	DisableParallelToolCalls bool
+	SessionID                string
+	CascadeID                string
+	ExecutionID              string
+	ModelAssignmentJWT       string
+	Matcher                  *SensitiveWordMatcher
+}
+
+type DevinUserJWT struct {
+	JWT           string
+	CustomBaseURL string
+}
+
+type DevinModelAssignment struct {
+	JWT      string
+	ModelUID string
+}
+
 // DevinUsage captures token accounting from response Field 7.
 type DevinUsage struct {
-	PromptTokens     int64             `json:"prompt_tokens"`
-	CompletionTokens int64             `json:"completion_tokens"`
-	CachedTokens     int64             `json:"cached_tokens"`
-	StatusCode       uint64            `json:"status_code,omitempty"`
-	RequestID        string            `json:"request_id,omitempty"`
-	ModelName        string            `json:"model_name,omitempty"`
-	Headers          map[string]string `json:"headers,omitempty"`
+	InputTokens       int64             `json:"input_tokens"`
+	OutputTokens      int64             `json:"output_tokens"`
+	CacheWriteTokens  int64             `json:"cache_write_tokens"`
+	CacheReadTokens   int64             `json:"cache_read_tokens"`
+	APIProvider       uint64            `json:"api_provider,omitempty"`
+	MessageID         string            `json:"message_id,omitempty"`
+	RequestID         string            `json:"request_id,omitempty"`
+	ModelUID          string            `json:"model_uid,omitempty"`
+	BillingModelUID   string            `json:"billing_model_uid,omitempty"`
+	RequestedModelUID string            `json:"requested_model_uid,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
 }
 
 // DevinFrameResult represents decoded content from a single Connect-proto frame.
 type DevinFrameResult struct {
+	MessageID               string
 	OutputID                string
+	RequestID               string
+	ActualModelUID          string
 	Timestamp               uint64
 	ContentText             string
 	DeltaTokens             uint64
-	StopReason              uint64 // 2/4=stop, 10=tool_calls
+	StopReason              uint64
 	ToolCallDeltas          []DevinToolCallDelta
 	ThinkingText            string
 	DeltaSignature          []byte
 	DeltaSignatureType      string
 	Latency                 float64
-	MessageID               string
+	CreditCost              int64
+	CommittedCreditCost     int64
+	CommittedACUCost        float64
+	Phase                   string
 	Usage                   *DevinUsage
 	ResponseDimensionGroups [][]byte
 	UnknownFieldNumbers     []int
-}
-
-// GenerateDevinDeviceFingerprint generates a 732-character hex device fingerprint.
-// When seed is empty, it generates a cryptographically random 732-character hex string per request (matching native devin-cli).
-// When seed is provided, it derives a deterministic 732-character hex fingerprint.
-func GenerateDevinDeviceFingerprint(seed string) string {
-	if seed == "" {
-		var b [DevinFingerprintHexLen / 2]byte
-		if _, err := rand.Read(b[:]); err == nil {
-			return hex.EncodeToString(b[:])
-		}
-		seed = uuid.New().String()
-	}
-	var sb strings.Builder
-	counter := 0
-	for sb.Len() < DevinFingerprintHexLen {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s-%d", seed, counter)))
-		sb.WriteString(hex.EncodeToString(h[:]))
-		counter++
-	}
-	// Truncate to exact 732 chars (11 full 64-char sha256 hex blocks + 28 chars of the 12th block) to match Devin CLI.
-	return sb.String()[:DevinFingerprintHexLen]
 }
 
 // GenerateDevinSentryTrace generates a Sentry distributed tracing header in the format:
@@ -243,82 +273,292 @@ func ReadConnectFrame(r io.Reader) (flag byte, payload []byte, err error) {
 	return flag, payload, nil
 }
 
-// BuildDevinClientMetadataBytes constructs the serialized bytes for Field 1 (ClientMetadata).
-func BuildDevinClientMetadataBytes(sessionToken, deviceSeed, osName string) []byte {
-	if osName == "" {
-		osName = runtime.GOOS
+func BuildDevinGetUserJWTRequest(sessionToken, deviceSeed string) []byte {
+	metadata := devinauth.BuildClientMetadataBytes(sessionToken, "", deviceSeed, "")
+	var request []byte
+	request = protowire.AppendTag(request, 1, protowire.BytesType)
+	request = protowire.AppendBytes(request, metadata)
+	return request
+}
+
+func decodeDevinUnaryPayload(data []byte, operation string) ([]byte, error) {
+	if len(data) < 2 || data[0] != 0x1f || data[1] != 0x8b {
+		return data, nil
 	}
-	deviceFingerprint := GenerateDevinDeviceFingerprint(deviceSeed)
+	reader, errReader := gzip.NewReader(bytes.NewReader(data))
+	if errReader != nil {
+		return nil, fmt.Errorf("decompress Devin %s response: %w", operation, errReader)
+	}
+	decoded, errRead := io.ReadAll(io.LimitReader(reader, maxDecompressedFrameSize+1))
+	_ = reader.Close()
+	if errRead != nil {
+		return nil, fmt.Errorf("read Devin %s response: %w", operation, errRead)
+	}
+	if len(decoded) > maxDecompressedFrameSize {
+		return nil, fmt.Errorf("Devin %s response exceeds maximum limit (%d)", operation, maxDecompressedFrameSize)
+	}
+	return decoded, nil
+}
 
-	var f1Bytes []byte
-	f1Bytes = protowire.AppendTag(f1Bytes, 1, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, "devin-cli")
+func ParseDevinGetUserJWTResponse(data []byte) (DevinUserJWT, error) {
+	var result DevinUserJWT
+	decoded, errDecode := decodeDevinUnaryPayload(data, "auth")
+	if errDecode != nil {
+		return result, errDecode
+	}
+	data = decoded
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n <= 0 {
+			return result, protowire.ParseError(n)
+		}
+		data = data[n:]
+		if typ == protowire.BytesType && (num == 1 || num == 2) {
+			value, m := protowire.ConsumeBytes(data)
+			if m <= 0 {
+				return result, protowire.ParseError(m)
+			}
+			if num == 1 {
+				result.JWT = string(value)
+			} else {
+				result.CustomBaseURL = string(value)
+			}
+			data = data[m:]
+			continue
+		}
+		m := protowire.ConsumeFieldValue(num, typ, data)
+		if m <= 0 {
+			return result, protowire.ParseError(m)
+		}
+		data = data[m:]
+	}
+	if strings.TrimSpace(result.JWT) == "" {
+		return result, errors.New("Devin GetUserJwt returned an empty user JWT")
+	}
+	result.CustomBaseURL = strings.TrimRight(strings.TrimSpace(result.CustomBaseURL), "/")
+	return result, nil
+}
 
-	f1Bytes = protowire.AppendTag(f1Bytes, 2, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, DevinDefaultClientVersion)
+func BuildDevinAssignModelRequest(sessionToken, deviceSeed, modelRouterUID, cascadeID string, prompt *DevinPrompt) []byte {
+	metadata := devinauth.BuildClientMetadataBytes(sessionToken, "", deviceSeed, "")
+	var request []byte
+	request = protowire.AppendTag(request, 1, protowire.BytesType)
+	request = protowire.AppendBytes(request, metadata)
+	request = protowire.AppendTag(request, 2, protowire.BytesType)
+	request = protowire.AppendString(request, modelRouterUID)
+	request = protowire.AppendTag(request, 3, protowire.BytesType)
+	request = protowire.AppendString(request, cascadeID)
+	if prompt != nil {
+		routerPrompt := *prompt
+		routerPrompt.MessageID = ""
+		request = protowire.AppendTag(request, 5, protowire.BytesType)
+		request = protowire.AppendBytes(request, buildDevinPromptBytes(routerPrompt, 0, cascadeID, true))
+	}
+	return request
+}
 
-	f1Bytes = protowire.AppendTag(f1Bytes, 3, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, sessionToken)
+func ParseDevinAssignModelResponse(data []byte) (DevinModelAssignment, error) {
+	var result DevinModelAssignment
+	decoded, errDecode := decodeDevinUnaryPayload(data, "model assignment")
+	if errDecode != nil {
+		return result, errDecode
+	}
+	assignments, errFields := consumeDevinBytesFields(decoded, 1)
+	if errFields != nil {
+		return result, errFields
+	}
+	if len(assignments) == 0 {
+		return result, errors.New("Devin AssignModel returned no assignment")
+	}
+	assignment := assignments[0]
+	for len(assignment) > 0 {
+		num, typ, n := protowire.ConsumeTag(assignment)
+		if n <= 0 {
+			return result, protowire.ParseError(n)
+		}
+		assignment = assignment[n:]
+		if typ == protowire.BytesType && (num == 1 || num == 2) {
+			value, m := protowire.ConsumeBytes(assignment)
+			if m <= 0 {
+				return result, protowire.ParseError(m)
+			}
+			if num == 1 {
+				result.JWT = string(value)
+			} else {
+				result.ModelUID = string(value)
+			}
+			assignment = assignment[m:]
+			continue
+		}
+		m := protowire.ConsumeFieldValue(num, typ, assignment)
+		if m <= 0 {
+			return result, protowire.ParseError(m)
+		}
+		assignment = assignment[m:]
+	}
+	if strings.TrimSpace(result.JWT) == "" || strings.TrimSpace(result.ModelUID) == "" {
+		return result, errors.New("Devin AssignModel returned an incomplete assignment")
+	}
+	return result, nil
+}
 
-	f1Bytes = protowire.AppendTag(f1Bytes, 4, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, "en")
+func consumeDevinBytesFields(data []byte, field protowire.Number) ([][]byte, error) {
+	var values [][]byte
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n <= 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+		if num == field && typ == protowire.BytesType {
+			value, m := protowire.ConsumeBytes(data)
+			if m <= 0 {
+				return nil, protowire.ParseError(m)
+			}
+			values = append(values, value)
+			data = data[m:]
+			continue
+		}
+		m := protowire.ConsumeFieldValue(num, typ, data)
+		if m <= 0 {
+			return nil, protowire.ParseError(m)
+		}
+		data = data[m:]
+	}
+	return values, nil
+}
 
-	f1Bytes = protowire.AppendTag(f1Bytes, 5, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, osName)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 7, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, DevinDefaultClientVersion)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 12, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, DevinDefaultClientName)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 28, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, DevinDefaultClientName)
-
-	f1Bytes = protowire.AppendTag(f1Bytes, 31, protowire.BytesType)
-	f1Bytes = protowire.AppendString(f1Bytes, deviceFingerprint)
-	return f1Bytes
+func buildDevinPromptBytes(prompt DevinPrompt, promptIndex int, cascadeID string, preserveEmptyID bool) []byte {
+	var payload []byte
+	messageID := prompt.MessageID
+	if messageID == "" && !preserveEmptyID {
+		seed := fmt.Sprintf("%s\x00%d\x00%d\x00%s", cascadeID, promptIndex, prompt.Source, prompt.ToolCallID)
+		messageID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(seed)).String()
+		if prompt.Source == 2 {
+			messageID = "bot-" + messageID
+		}
+	}
+	if messageID != "" {
+		payload = protowire.AppendTag(payload, 1, protowire.BytesType)
+		payload = protowire.AppendString(payload, messageID)
+	}
+	source := prompt.Source
+	if source <= 0 {
+		source = 1 // default to user
+	}
+	payload = protowire.AppendTag(payload, 2, protowire.VarintType)
+	payload = protowire.AppendVarint(payload, uint64(source))
+	payload = protowire.AppendTag(payload, 3, protowire.BytesType)
+	payload = protowire.AppendString(payload, prompt.Content)
+	for _, toolCall := range prompt.ToolCalls {
+		var toolCallBytes []byte
+		if toolCall.ID != "" {
+			toolCallBytes = protowire.AppendTag(toolCallBytes, 1, protowire.BytesType)
+			toolCallBytes = protowire.AppendString(toolCallBytes, toolCall.ID)
+		}
+		if toolCall.Name != "" {
+			toolCallBytes = protowire.AppendTag(toolCallBytes, 2, protowire.BytesType)
+			toolCallBytes = protowire.AppendString(toolCallBytes, toolCall.Name)
+		}
+		if toolCall.Arguments != "" {
+			toolCallBytes = protowire.AppendTag(toolCallBytes, 3, protowire.BytesType)
+			toolCallBytes = protowire.AppendString(toolCallBytes, toolCall.Arguments)
+		}
+		payload = protowire.AppendTag(payload, 6, protowire.BytesType)
+		payload = protowire.AppendBytes(payload, toolCallBytes)
+	}
+	if prompt.ToolCallID != "" {
+		payload = protowire.AppendTag(payload, 7, protowire.BytesType)
+		payload = protowire.AppendString(payload, prompt.ToolCallID)
+	}
+	if prompt.ToolResultErr {
+		payload = protowire.AppendTag(payload, 9, protowire.VarintType)
+		payload = protowire.AppendVarint(payload, 1)
+	}
+	for _, image := range prompt.Images {
+		data := strings.TrimSpace(image.Base64Data)
+		if data == "" {
+			continue
+		}
+		var imageBytes []byte
+		imageBytes = protowire.AppendTag(imageBytes, 1, protowire.BytesType)
+		imageBytes = protowire.AppendString(imageBytes, data)
+		mimeType := strings.TrimSpace(image.MimeType)
+		if mimeType == "" {
+			mimeType = "image/png"
+		}
+		imageBytes = protowire.AppendTag(imageBytes, 2, protowire.BytesType)
+		imageBytes = protowire.AppendString(imageBytes, mimeType)
+		payload = protowire.AppendTag(payload, 10, protowire.BytesType)
+		payload = protowire.AppendBytes(payload, imageBytes)
+	}
+	if prompt.Thinking != "" {
+		payload = protowire.AppendTag(payload, 11, protowire.BytesType)
+		payload = protowire.AppendString(payload, prompt.Thinking)
+	}
+	if len(prompt.Signature) > 0 {
+		payload = protowire.AppendTag(payload, 12, protowire.BytesType)
+		payload = protowire.AppendBytes(payload, prompt.Signature)
+	}
+	if prompt.SignatureType != "" {
+		payload = protowire.AppendTag(payload, 18, protowire.BytesType)
+		payload = protowire.AppendString(payload, prompt.SignatureType)
+	}
+	return payload
 }
 
 // BuildDevinGetChatMessageRequest encodes an entire GetChatMessageRequest protobuf payload.
-func BuildDevinGetChatMessageRequest(
-	sessionToken string,
-	deviceSeed string,
-	chatModelUID string,
-	systemPrompt string,
-	prompts []DevinPrompt,
-	tools []DevinTool,
-	temperature *float64,
-	maxTokens int,
-	sessionID string,
-	cascadeID string,
-	matcher *SensitiveWordMatcher,
-) []byte {
-	if maxTokens <= 0 {
-		maxTokens = DevinDefaultMaxTokens
+func BuildDevinGetChatMessageRequest(request DevinChatRequest) []byte {
+	completion := request.Completion
+	if completion.MaxTokens <= 0 {
+		completion.MaxTokens = DevinDefaultMaxTokens
 	}
-	if sessionID == "" {
-		sessionID = uuid.New().String()
+	if completion.MaxNewlines <= 0 {
+		completion.MaxNewlines = 200
 	}
-	if cascadeID == "" {
-		cascadeID = sessionID
+	if completion.TopK <= 0 {
+		completion.TopK = 50
+	}
+	if completion.Temperature == nil {
+		value := 0.4
+		completion.Temperature = &value
+	}
+	if completion.FirstTemperature == nil {
+		value := *completion.Temperature
+		completion.FirstTemperature = &value
+	}
+	if completion.TopP == nil {
+		value := 1.0
+		completion.TopP = &value
+	}
+	if len(completion.StopPatterns) == 0 {
+		completion.StopPatterns = []string{"<|user|>", "<|bot|>", "<|context_request|>", "<|endoftext|>", "<|end_of_turn|>"}
+	}
+	if request.SessionID == "" {
+		request.SessionID = uuid.New().String()
+	}
+	if request.CascadeID == "" {
+		request.CascadeID = request.SessionID
+	}
+	if request.ExecutionID == "" {
+		request.ExecutionID = uuid.New().String()
 	}
 	osName := runtime.GOOS
 
-	estimatedSize := 4096 + len(systemPrompt)
-	for _, p := range prompts {
+	estimatedSize := 4096 + len(request.SystemPrompt)
+	for _, p := range request.Prompts {
 		estimatedSize += 256 + len(p.Content)
 	}
 	reqBytes := make([]byte, 0, estimatedSize)
 
 	// 1. ClientMetadata (Field 1)
-	f1Bytes := BuildDevinClientMetadataBytes(sessionToken, deviceSeed, osName)
+	f1Bytes := devinauth.BuildClientMetadataBytes(request.SessionToken, request.UserJWT, request.DeviceSeed, osName)
 	reqBytes = protowire.AppendTag(reqBytes, 1, protowire.BytesType)
 	reqBytes = protowire.AppendBytes(reqBytes, f1Bytes)
 
 	// 2. System prompt (Field 2)
-	if systemPrompt != "" {
-		sanitized := SanitizeDevinSystemPrompt(systemPrompt, matcher)
+	if request.SystemPrompt != "" {
+		sanitized := SanitizeDevinSystemPrompt(request.SystemPrompt, request.Matcher)
 		if sanitized != "" {
 			reqBytes = protowire.AppendTag(reqBytes, 2, protowire.BytesType)
 			reqBytes = protowire.AppendString(reqBytes, sanitized)
@@ -326,87 +566,9 @@ func BuildDevinGetChatMessageRequest(
 	}
 
 	// 3. Repeated History Prompts (Field 3)
-	for _, p := range prompts {
-		var pBytes []byte
-
-		msgID := p.MessageID
-		if msgID == "" {
-			msgID = uuid.New().String()
-		}
-		pBytes = protowire.AppendTag(pBytes, 1, protowire.BytesType)
-		pBytes = protowire.AppendString(pBytes, msgID)
-
-		source := p.Source
-		if source <= 0 {
-			source = 1 // default to user
-		}
-		pBytes = protowire.AppendTag(pBytes, 2, protowire.VarintType)
-		pBytes = protowire.AppendVarint(pBytes, uint64(source))
-
-		content := p.Content
-		pBytes = protowire.AppendTag(pBytes, 3, protowire.BytesType)
-		pBytes = protowire.AppendString(pBytes, content)
-
-		for _, tc := range p.ToolCalls {
-			var tcBytes []byte
-			if tc.ID != "" {
-				tcBytes = protowire.AppendTag(tcBytes, 1, protowire.BytesType)
-				tcBytes = protowire.AppendString(tcBytes, tc.ID)
-			}
-			if tc.Name != "" {
-				tcBytes = protowire.AppendTag(tcBytes, 2, protowire.BytesType)
-				tcBytes = protowire.AppendString(tcBytes, tc.Name)
-			}
-			if tc.Arguments != "" {
-				tcBytes = protowire.AppendTag(tcBytes, 3, protowire.BytesType)
-				tcBytes = protowire.AppendString(tcBytes, tc.Arguments)
-			}
-			pBytes = protowire.AppendTag(pBytes, 6, protowire.BytesType)
-			pBytes = protowire.AppendBytes(pBytes, tcBytes)
-		}
-
-		if p.ToolCallID != "" {
-			pBytes = protowire.AppendTag(pBytes, 7, protowire.BytesType)
-			pBytes = protowire.AppendString(pBytes, p.ToolCallID)
-		}
-
-		for _, img := range p.Images {
-			data := strings.TrimSpace(img.Base64Data)
-			if data == "" {
-				continue
-			}
-			var imgBytes []byte
-			imgBytes = protowire.AppendTag(imgBytes, 1, protowire.BytesType)
-			imgBytes = protowire.AppendString(imgBytes, data)
-
-			mime := strings.TrimSpace(img.MimeType)
-			if mime == "" {
-				mime = "image/png"
-			}
-			imgBytes = protowire.AppendTag(imgBytes, 2, protowire.BytesType)
-			imgBytes = protowire.AppendString(imgBytes, mime)
-
-			pBytes = protowire.AppendTag(pBytes, 10, protowire.BytesType)
-			pBytes = protowire.AppendBytes(pBytes, imgBytes)
-		}
-
-		if p.Thinking != "" {
-			pBytes = protowire.AppendTag(pBytes, 11, protowire.BytesType)
-			pBytes = protowire.AppendString(pBytes, p.Thinking)
-		}
-
-		if len(p.Signature) > 0 {
-			pBytes = protowire.AppendTag(pBytes, 12, protowire.BytesType)
-			pBytes = protowire.AppendBytes(pBytes, p.Signature)
-		}
-
-		if p.SignatureType != "" {
-			pBytes = protowire.AppendTag(pBytes, 18, protowire.BytesType)
-			pBytes = protowire.AppendString(pBytes, p.SignatureType)
-		}
-
+	for promptIndex, prompt := range request.Prompts {
 		reqBytes = protowire.AppendTag(reqBytes, 3, protowire.BytesType)
-		reqBytes = protowire.AppendBytes(reqBytes, pBytes)
+		reqBytes = protowire.AppendBytes(reqBytes, buildDevinPromptBytes(prompt, promptIndex, request.CascadeID, false))
 	}
 
 	// 4. Fixed flags (Field 7: Varint 5)
@@ -419,41 +581,45 @@ func BuildDevinGetChatMessageRequest(
 	f8Bytes = protowire.AppendVarint(f8Bytes, 1)
 
 	f8Bytes = protowire.AppendTag(f8Bytes, 2, protowire.VarintType)
-	f8Bytes = protowire.AppendVarint(f8Bytes, uint64(maxTokens))
+	f8Bytes = protowire.AppendVarint(f8Bytes, uint64(completion.MaxTokens))
 
 	f8Bytes = protowire.AppendTag(f8Bytes, 3, protowire.VarintType)
-	f8Bytes = protowire.AppendVarint(f8Bytes, 400)
+	f8Bytes = protowire.AppendVarint(f8Bytes, uint64(completion.MaxNewlines))
 
-	tempVal := 1.0
-	if temperature != nil {
-		tempVal = *temperature
-	}
 	f8Bytes = protowire.AppendTag(f8Bytes, 5, protowire.Fixed64Type)
-	f8Bytes = protowire.AppendFixed64(f8Bytes, math.Float64bits(tempVal))
+	f8Bytes = protowire.AppendFixed64(f8Bytes, math.Float64bits(*completion.Temperature))
+
+	f8Bytes = protowire.AppendTag(f8Bytes, 6, protowire.Fixed64Type)
+	f8Bytes = protowire.AppendFixed64(f8Bytes, math.Float64bits(*completion.FirstTemperature))
 
 	f8Bytes = protowire.AppendTag(f8Bytes, 7, protowire.VarintType)
-	f8Bytes = protowire.AppendVarint(f8Bytes, 40)
+	f8Bytes = protowire.AppendVarint(f8Bytes, uint64(completion.TopK))
 
 	f8Bytes = protowire.AppendTag(f8Bytes, 8, protowire.Fixed64Type)
-	f8Bytes = protowire.AppendFixed64(f8Bytes, math.Float64bits(float64(float32(0.95))))
+	f8Bytes = protowire.AppendFixed64(f8Bytes, math.Float64bits(*completion.TopP))
+
+	for _, pattern := range completion.StopPatterns {
+		if pattern == "" {
+			continue
+		}
+		f8Bytes = protowire.AppendTag(f8Bytes, 9, protowire.BytesType)
+		f8Bytes = protowire.AppendString(f8Bytes, pattern)
+	}
+
+	f8Bytes = protowire.AppendTag(f8Bytes, 11, protowire.Fixed64Type)
+	f8Bytes = protowire.AppendFixed64(f8Bytes, math.Float64bits(1))
 
 	reqBytes = protowire.AppendTag(reqBytes, 8, protowire.BytesType)
 	reqBytes = protowire.AppendBytes(reqBytes, f8Bytes)
 
 	// 6. Repeated Tools (Field 10)
-	for _, tool := range tools {
+	for _, tool := range request.Tools {
 		var tBytes []byte
 		if tool.Name != "" {
 			tBytes = protowire.AppendTag(tBytes, 1, protowire.BytesType)
 			tBytes = protowire.AppendString(tBytes, tool.Name)
 		}
 		desc := tool.Description
-		// Claude Code subagent tool descriptions hardcode snake_case "task_id", but Devin's
-		// upstream tool execution environment strictly expects camelCase "taskId". Normalizing
-		// the prompt description prevents the model from generating incompatible parameter names.
-		if strings.Contains(desc, "Takes a task_id parameter identifying the task") {
-			desc = strings.ReplaceAll(desc, "Takes a task_id parameter identifying the task", "Takes a taskId parameter identifying the task")
-		}
 		if desc != "" {
 			tBytes = protowire.AppendTag(tBytes, 2, protowire.BytesType)
 			tBytes = protowire.AppendString(tBytes, desc)
@@ -462,9 +628,39 @@ func BuildDevinGetChatMessageRequest(
 			tBytes = protowire.AppendTag(tBytes, 3, protowire.BytesType)
 			tBytes = protowire.AppendBytes(tBytes, tool.Parameters)
 		}
+		if tool.Strict {
+			tBytes = protowire.AppendTag(tBytes, 12, protowire.VarintType)
+			tBytes = protowire.AppendVarint(tBytes, 1)
+		}
 		reqBytes = protowire.AppendTag(reqBytes, 10, protowire.BytesType)
 		reqBytes = protowire.AppendBytes(reqBytes, tBytes)
 	}
+
+	if request.DisableParallelToolCalls {
+		reqBytes = protowire.AppendTag(reqBytes, 11, protowire.VarintType)
+		reqBytes = protowire.AppendVarint(reqBytes, 1)
+	}
+
+	toolChoice := request.ToolChoice
+	if toolChoice.OptionName == "" && toolChoice.ToolName == "" {
+		toolChoice.OptionName = "auto"
+	}
+	var toolChoiceBytes []byte
+	if toolChoice.ToolName != "" {
+		toolChoiceBytes = protowire.AppendTag(toolChoiceBytes, 2, protowire.BytesType)
+		toolChoiceBytes = protowire.AppendString(toolChoiceBytes, toolChoice.ToolName)
+	} else {
+		toolChoiceBytes = protowire.AppendTag(toolChoiceBytes, 1, protowire.BytesType)
+		toolChoiceBytes = protowire.AppendString(toolChoiceBytes, toolChoice.OptionName)
+	}
+	reqBytes = protowire.AppendTag(reqBytes, 12, protowire.BytesType)
+	reqBytes = protowire.AppendBytes(reqBytes, toolChoiceBytes)
+
+	var cacheOptions []byte
+	cacheOptions = protowire.AppendTag(cacheOptions, 1, protowire.VarintType)
+	cacheOptions = protowire.AppendVarint(cacheOptions, 1)
+	reqBytes = protowire.AppendTag(reqBytes, 13, protowire.BytesType)
+	reqBytes = protowire.AppendBytes(reqBytes, cacheOptions)
 
 	// 7. Thread session metadata (Field 15)
 	// In native devin-cli:
@@ -472,11 +668,11 @@ func BuildDevinGetChatMessageRequest(
 	// Field 2: turnIndex (per-session request ordinal, omitted when 0)
 	// Field 3: 4 (varint)
 	// Field 4: 14 (emitted conditionally on user-turn boundaries)
-	turnIndex := NextDevinSessionTurnIndex(sessionID)
+	turnIndex := NextDevinSessionTurnIndex(request.SessionID)
 
 	var f15Bytes []byte
 	f15Bytes = protowire.AppendTag(f15Bytes, 1, protowire.BytesType)
-	f15Bytes = protowire.AppendString(f15Bytes, sessionID)
+	f15Bytes = protowire.AppendString(f15Bytes, request.SessionID)
 
 	if turnIndex > 0 {
 		f15Bytes = protowire.AppendTag(f15Bytes, 2, protowire.VarintType)
@@ -487,8 +683,8 @@ func BuildDevinGetChatMessageRequest(
 	f15Bytes = protowire.AppendVarint(f15Bytes, 4)
 
 	// In native devin-cli, Field 15.4=14 is emitted on user-turn boundaries
-	if len(prompts) > 0 && prompts[len(prompts)-1].Source == 1 {
-		if turnIndex == 0 || len(prompts) < 2 || prompts[len(prompts)-2].Source != 1 {
+	if len(request.Prompts) > 0 && request.Prompts[len(request.Prompts)-1].Source == 1 {
+		if turnIndex == 0 || len(request.Prompts) < 2 || request.Prompts[len(request.Prompts)-2].Source != 1 {
 			f15Bytes = protowire.AppendTag(f15Bytes, 4, protowire.VarintType)
 			f15Bytes = protowire.AppendVarint(f15Bytes, 14)
 		}
@@ -499,7 +695,7 @@ func BuildDevinGetChatMessageRequest(
 
 	// 8. Cascade ID (Field 16: session-stable prompt cache key)
 	reqBytes = protowire.AppendTag(reqBytes, 16, protowire.BytesType)
-	reqBytes = protowire.AppendString(reqBytes, cascadeID)
+	reqBytes = protowire.AppendString(reqBytes, request.CascadeID)
 
 	// 9. Fixed flag (Field 20: Varint 1)
 	reqBytes = protowire.AppendTag(reqBytes, 20, protowire.VarintType)
@@ -507,7 +703,15 @@ func BuildDevinGetChatMessageRequest(
 
 	// 10. Model UID (Field 21)
 	reqBytes = protowire.AppendTag(reqBytes, 21, protowire.BytesType)
-	reqBytes = protowire.AppendString(reqBytes, chatModelUID)
+	reqBytes = protowire.AppendString(reqBytes, request.ChatModelUID)
+
+	reqBytes = protowire.AppendTag(reqBytes, 22, protowire.BytesType)
+	reqBytes = protowire.AppendString(reqBytes, request.ExecutionID)
+
+	if request.ModelAssignmentJWT != "" {
+		reqBytes = protowire.AppendTag(reqBytes, 26, protowire.BytesType)
+		reqBytes = protowire.AppendString(reqBytes, request.ModelAssignmentJWT)
+	}
 
 	return reqBytes
 }
@@ -540,6 +744,10 @@ func ParseDevinFrame(payload []byte) (DevinFrameResult, error) {
 				res.DeltaTokens = v
 			case 5:
 				res.StopReason = v
+			case 14:
+				res.CreditCost = int64(v)
+			case 18:
+				res.CommittedCreditCost = int64(v)
 			}
 
 		case protowire.Fixed64Type:
@@ -548,8 +756,11 @@ func ParseDevinFrame(payload []byte) (DevinFrameResult, error) {
 				return res, fmt.Errorf("consume fixed64 error at offset %d: %w", pos, protowire.ParseError(fn))
 			}
 			pos += fn
-			if num == 12 {
+			switch num {
+			case 12:
 				res.Latency = math.Float64frombits(v)
+			case 22:
+				res.CommittedACUCost = math.Float64frombits(v)
 			}
 
 		case protowire.Fixed32Type:
@@ -568,7 +779,7 @@ func ParseDevinFrame(payload []byte) (DevinFrameResult, error) {
 
 			switch num {
 			case 1:
-				res.OutputID = string(val)
+				res.MessageID = string(val)
 			case 2:
 				res.Timestamp = parseDevinTimestamp(val)
 			case 3:
@@ -583,10 +794,16 @@ func ParseDevinFrame(payload []byte) (DevinFrameResult, error) {
 				thinkingParts = append(thinkingParts, string(val))
 			case 10:
 				res.DeltaSignature = append(res.DeltaSignature, val...)
+			case 15:
+				res.OutputID = string(val)
 			case 17:
-				res.MessageID = string(val)
+				res.RequestID = string(val)
 			case 21:
 				res.DeltaSignatureType = string(val)
+			case 23:
+				res.ActualModelUID = string(val)
+			case 25:
+				res.Phase = string(val)
 			case 28:
 				res.ResponseDimensionGroups = append(res.ResponseDimensionGroups, val)
 			default:
@@ -608,42 +825,13 @@ func ParseDevinFrame(payload []byte) (DevinFrameResult, error) {
 	return res, nil
 }
 
-// SanitizeDevinSystemPrompt strips Claude Code attribution and CLI identity headers
-// (referencing Antigravity conventions), and applies zero-width obfuscation for configured sensitive words.
+// SanitizeDevinSystemPrompt normalizes line endings and applies explicitly configured obfuscation.
 func SanitizeDevinSystemPrompt(prompt string, matcher *SensitiveWordMatcher) string {
-	if prompt == "" {
-		return ""
+	prompt = strings.ReplaceAll(prompt, "\r\n", "\n")
+	if matcher != nil {
+		return matcher.ObfuscateText(prompt)
 	}
-	normalized := strings.ReplaceAll(prompt, "\r\n", "\n")
-	lines := strings.Split(normalized, "\n")
-	var kept []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if util.IsClaudeCodeAttributionSystemText(trimmed) {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "You are Claude Code") {
-			continue
-		}
-		if strings.Contains(trimmed, "authorized security testing") || strings.Contains(trimmed, "destructive techniques, DoS attacks") {
-			continue
-		}
-		if strings.Contains(trimmed, "Claude Code is available as a CLI") {
-			continue
-		}
-		if strings.Contains(trimmed, "Fast mode for Claude Code") {
-			continue
-		}
-		if matcher != nil && matcher.Matches(trimmed) {
-			continue
-		}
-		kept = append(kept, line)
-	}
-	res := strings.TrimSpace(strings.Join(kept, "\n"))
-	if matcher != nil && res != "" {
-		res = matcher.ObfuscateText(res)
-	}
-	return res
+	return prompt
 }
 
 func parseDevinToolCallDelta(data []byte) (DevinToolCallDelta, error) {
@@ -663,8 +851,8 @@ func parseDevinToolCallDelta(data []byte) (DevinToolCallDelta, error) {
 				return tc, protowire.ParseError(vn)
 			}
 			pos += vn
-			if num == 4 {
-				tc.Index = int(v)
+			if num == 6 {
+				tc.IsCustom = v != 0
 			}
 		case protowire.BytesType:
 			val, bn := protowire.ConsumeBytes(data[pos:])
@@ -679,6 +867,10 @@ func parseDevinToolCallDelta(data []byte) (DevinToolCallDelta, error) {
 				tc.Name = string(val)
 			case 3:
 				tc.Arguments = string(val)
+			case 4:
+				tc.InvalidJSON = string(val)
+			case 5:
+				tc.InvalidJSONError = string(val)
 			}
 		default:
 			nSkip := protowire.ConsumeFieldValue(num, typ, data[pos:])
@@ -770,16 +962,16 @@ func parseDevinUsageField(data []byte) *DevinUsage {
 			}
 			pos += vn
 			switch num {
-			case 2: // Prompt tokens (uncached input from turn message)
-				u.PromptTokens += int64(v)
+			case 2: // Input tokens
+				u.InputTokens = int64(v)
 			case 3: // Output tokens
-				u.CompletionTokens = int64(v)
-			case 4: // Additional context/system prompt tokens in OpenAI-family models (total prompt = 2 + 4)
-				u.PromptTokens += int64(v)
-			case 5: // Cache read tokens
-				u.CachedTokens = int64(v)
-			case 6: // Status code
-				u.StatusCode = v
+				u.OutputTokens = int64(v)
+			case 4: // Cache-write tokens
+				u.CacheWriteTokens = int64(v)
+			case 5: // Cache-read tokens
+				u.CacheReadTokens = int64(v)
+			case 6: // API provider enum
+				u.APIProvider = v
 			}
 		case protowire.BytesType:
 			val, bn := protowire.ConsumeBytes(data[pos:])
@@ -788,6 +980,8 @@ func parseDevinUsageField(data []byte) *DevinUsage {
 			}
 			pos += bn
 			switch num {
+			case 7:
+				u.MessageID = string(val)
 			case 8:
 				k, v := parseDevinHeaderField(val)
 				if k != "" {
@@ -802,7 +996,11 @@ func parseDevinUsageField(data []byte) *DevinUsage {
 					u.RequestID = string(val)
 				}
 			case 9:
-				u.ModelName = string(val)
+				u.ModelUID = string(val)
+			case 10:
+				u.BillingModelUID = string(val)
+			case 11:
+				u.RequestedModelUID = string(val)
 			}
 		case protowire.Fixed64Type:
 			_, fn := protowire.ConsumeFixed64(data[pos:])

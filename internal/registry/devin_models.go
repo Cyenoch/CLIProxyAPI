@@ -1,10 +1,10 @@
 package registry
 
 import (
-	"bytes"
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -15,42 +15,27 @@ import (
 var embeddedDevinModelsJSON []byte
 
 type devinModelsFilePayload struct {
-	Devin  []*ModelInfo `json:"devin,omitempty"`
-	Models []*ModelInfo `json:"models,omitempty"`
+	Devin []*ModelInfo `json:"devin,omitempty"`
 }
 
 type devinModelsStore struct {
-	mu       sync.RWMutex
-	models   []*ModelInfo
-	rawJSON  []byte
-	revision uint64
+	mu     sync.RWMutex
+	models []*ModelInfo
 }
 
 var devinCatalogStore = &devinModelsStore{}
 
 func init() {
 	if _, err := loadDevinModelsFromBytes(embeddedDevinModelsJSON, "embed"); err != nil {
-		log.Warnf("registry: failed to parse embedded devin_models.json (will rely on static fallback and remote refresh): %v", err)
+		log.Warnf("registry: failed to parse embedded devin_models.json (Devin models unavailable until a valid refresh): %v", err)
 	}
 }
 
-// GetDevinModels returns the active Devin model catalog.
-// It prioritizes the dynamic/embedded devin_models.json catalog, then models.json's devin section,
-// and finally hardcoded staticDevinModels.
+// GetDevinModels returns a copy of the active catalog, initially loaded from the embedded snapshot.
 func GetDevinModels() []*ModelInfo {
 	devinCatalogStore.mu.RLock()
-	models := devinCatalogStore.models
-	devinCatalogStore.mu.RUnlock()
-
-	if len(models) > 0 {
-		return cloneModelInfos(models)
-	}
-
-	if m := getModels(); m != nil && len(m.Devin) > 0 {
-		return cloneModelInfos(m.Devin)
-	}
-
-	return cloneModelInfos(staticDevinModels)
+	defer devinCatalogStore.mu.RUnlock()
+	return cloneModelInfos(devinCatalogStore.models)
 }
 
 // LookupDevinModel looks up a model definition from the active Devin catalog.
@@ -66,10 +51,6 @@ func LookupDevinModel(modelID string) *ModelInfo {
 	models := devinCatalogStore.models
 	devinCatalogStore.mu.RUnlock()
 
-	if len(models) == 0 {
-		models = GetDevinModels()
-	}
-
 	for _, m := range models {
 		mClean := strings.ToLower(strings.TrimPrefix(m.ID, "devin/"))
 		if mClean == clean {
@@ -79,72 +60,33 @@ func LookupDevinModel(modelID string) *ModelInfo {
 	return nil
 }
 
-// GetDevinModelsJSON returns the current raw JSON payload of the Devin model catalog.
-func GetDevinModelsJSON() []byte {
-	data, _ := GetDevinModelsSnapshot()
-	return data
-}
-
-// GetDevinModelsRevision returns the revision counter of the Devin model catalog.
-func GetDevinModelsRevision() uint64 {
-	devinCatalogStore.mu.RLock()
-	defer devinCatalogStore.mu.RUnlock()
-	return devinCatalogStore.revision
-}
-
-// GetDevinModelsSnapshot returns a copy of raw JSON and current catalog revision.
-func GetDevinModelsSnapshot() ([]byte, uint64) {
-	devinCatalogStore.mu.RLock()
-	defer devinCatalogStore.mu.RUnlock()
-	return append([]byte(nil), devinCatalogStore.rawJSON...), devinCatalogStore.revision
-}
-
 func loadDevinModelsFromBytes(data []byte, source string) (bool, error) {
 	models, err := ValidateDevinModelsJSON(data)
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", source, err)
 	}
 
-	clonedData := append([]byte(nil), data...)
 	devinCatalogStore.mu.Lock()
-	if bytes.Equal(devinCatalogStore.rawJSON, clonedData) {
+	if reflect.DeepEqual(devinCatalogStore.models, models) {
 		devinCatalogStore.mu.Unlock()
 		return false, nil
 	}
 	devinCatalogStore.models = models
-	devinCatalogStore.rawJSON = clonedData
-	devinCatalogStore.revision++
 	devinCatalogStore.mu.Unlock()
 
 	return true, nil
 }
 
-// ValidateDevinModelsJSON parses and validates a Devin model catalog payload.
-// Accepts {"devin": [...]}, {"models": [...]}, or a direct JSON array of ModelInfo.
+// ValidateDevinModelsJSON validates the {"devin": [...]} catalog produced by fetch_devin_models.
 func ValidateDevinModelsJSON(data []byte) ([]*ModelInfo, error) {
-	if len(bytes.TrimSpace(data)) == 0 {
-		return nil, fmt.Errorf("empty Devin models payload")
-	}
-
-	// 1. Try envelope {"devin": [...]} or {"models": [...]}
 	var payload devinModelsFilePayload
-	if err := json.Unmarshal(data, &payload); err == nil {
-		candidates := payload.Devin
-		if len(candidates) == 0 {
-			candidates = payload.Models
-		}
-		if len(candidates) > 0 {
-			return sanitizeAndValidateDevinModels(candidates)
-		}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("decode Devin catalog: %w", err)
 	}
-
-	// 2. Try raw array []*ModelInfo
-	var rawList []*ModelInfo
-	if err := json.Unmarshal(data, &rawList); err == nil && len(rawList) > 0 {
-		return sanitizeAndValidateDevinModels(rawList)
+	if len(payload.Devin) == 0 {
+		return nil, fmt.Errorf("Devin catalog must contain a non-empty devin array")
 	}
-
-	return nil, fmt.Errorf("invalid Devin models JSON: expected non-empty 'devin'/'models' array or model list")
+	return sanitizeAndValidateDevinModels(payload.Devin)
 }
 
 func sanitizeAndValidateDevinModels(models []*ModelInfo) ([]*ModelInfo, error) {

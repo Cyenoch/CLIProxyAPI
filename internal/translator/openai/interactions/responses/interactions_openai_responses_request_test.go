@@ -15,8 +15,12 @@ func TestConvertOpenAIResponsesRequestToInteractions(t *testing.T) {
 			{"type":"function_call","name":"lookup","call_id":"call_1","arguments":"{\"q\":\"x\"}"},
 			{"type":"function_call_output","call_id":"call_1","output":{"ok":true}}
 		],
-		"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+		"tools":[{"type":"function","name":"lookup","strict":true,"parameters":{"type":"object"}}],
 		"tool_choice":"auto",
+		"parallel_tool_calls":false,
+		"max_output_tokens":2048,
+		"temperature":0.2,
+		"top_p":0.8,
 		"reasoning":{"effort":"high","summary":"auto"},
 		"response_format":{"type":"json_object"},
 		"stream":true
@@ -59,11 +63,26 @@ func TestConvertOpenAIResponsesRequestToInteractions(t *testing.T) {
 	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "lookup" {
 		t.Fatalf("tool name = %q, want lookup. Output: %s", got, string(out))
 	}
+	if !gjson.GetBytes(out, "tools.0.strict").Bool() {
+		t.Fatalf("tool strict flag missing. Output: %s", string(out))
+	}
 	if got := gjson.GetBytes(out, "generation_config.tool_choice").String(); got != "auto" {
 		t.Fatalf("tool_choice = %q, want auto. Output: %s", got, string(out))
 	}
 	if got := gjson.GetBytes(out, "response_format.type").String(); got != "json_object" {
 		t.Fatalf("response_format.type = %q, want json_object. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "generation_config.max_output_tokens").Int(); got != 2048 {
+		t.Fatalf("max_output_tokens = %d, want 2048. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "generation_config.temperature").Float(); got != 0.2 {
+		t.Fatalf("temperature = %v, want 0.2. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "generation_config.top_p").Float(); got != 0.8 {
+		t.Fatalf("top_p = %v, want 0.8. Output: %s", got, string(out))
+	}
+	if parallel := gjson.GetBytes(out, "parallel_tool_calls"); !parallel.Exists() || parallel.Bool() {
+		t.Fatalf("parallel_tool_calls = %s, want false. Output: %s", parallel.Raw, string(out))
 	}
 }
 

@@ -98,11 +98,7 @@ func (e *DevinExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if req == nil {
 		return nil
 	}
-	apiKey, _, _ := devinAuthCredentials(auth)
-	if apiKey != "" {
-		// Codeium/Devin Connect-RPC upstream expects "Basic <token>-<token>" as its wire authentication header.
-		req.Header.Set("Authorization", "Basic "+apiKey+"-"+apiKey)
-	}
+	req.Header.Del("Authorization")
 	req.Header.Set("Content-Type", "application/connect+proto")
 	req.Header.Set("Connect-Protocol-Version", "1")
 	req.Header.Set("Accept", "*/*")
@@ -139,6 +135,70 @@ func (e *DevinExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	return httpClient.Do(httpReq)
 }
 
+func (e *DevinExecutor) fetchDevinUserJWT(ctx context.Context, auth *cliproxyauth.Auth, sessionToken, baseURL, deviceSeed string) (helps.DevinUserJWT, error) {
+	body := helps.BuildDevinGetUserJWTRequest(sessionToken, deviceSeed)
+	payload, errFetch := e.fetchDevinCredential(ctx, auth, baseURL, helps.DevinAuthPath, body)
+	if errFetch != nil {
+		return helps.DevinUserJWT{}, errFetch
+	}
+	result, errParse := helps.ParseDevinGetUserJWTResponse(payload)
+	if errParse != nil {
+		return result, fmt.Errorf("parse Devin auth response: %w", errParse)
+	}
+	return result, nil
+}
+
+// assignDevinModel resolves a server-side router uid (e.g. "adaptive") into the
+// concrete model uid plus the assignment JWT that authorizes it. The router uid
+// is never a legal chat_model_uid, so a failed or incomplete assignment fails
+// the turn instead of falling back to the router id. The cascade id must match
+// the following GetChatMessage call or the assignment JWT is rejected.
+func (e *DevinExecutor) assignDevinModel(ctx context.Context, auth *cliproxyauth.Auth, sessionToken, baseURL, deviceSeed, modelRouterUID, cascadeID string, prompt *helps.DevinPrompt) (helps.DevinModelAssignment, error) {
+	body := helps.BuildDevinAssignModelRequest(sessionToken, deviceSeed, modelRouterUID, cascadeID, prompt)
+	payload, errFetch := e.fetchDevinCredential(ctx, auth, baseURL, helps.DevinAssignModelPath, body)
+	if errFetch != nil {
+		return helps.DevinModelAssignment{}, errFetch
+	}
+	result, errParse := helps.ParseDevinAssignModelResponse(payload)
+	if errParse != nil {
+		return result, fmt.Errorf("parse Devin model assignment response: %w", errParse)
+	}
+	return result, nil
+}
+
+// fetchDevinCredential performs the unary RPCs that acquire chat credentials.
+func (e *DevinExecutor) fetchDevinCredential(ctx context.Context, auth *cliproxyauth.Auth, baseURL, path string, body []byte) ([]byte, error) {
+	request, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+path, bytes.NewReader(body))
+	if errRequest != nil {
+		return nil, fmt.Errorf("create Devin credential request %s: %w", path, errRequest)
+	}
+	request.Header.Set("Content-Type", "application/proto")
+	request.Header.Set("Connect-Protocol-Version", "1")
+	request.Header.Set("Accept", "*/*")
+	request.Header.Set("Accept-Encoding", "identity")
+	if auth != nil {
+		util.ApplyCustomHeadersFromAttrs(request, auth.Attributes)
+	}
+	client := helps.NewDevinHTTPClient(ctx, e.cfg, auth, 30*time.Second)
+	response, errDo := client.Do(request)
+	if errDo != nil {
+		return nil, fmt.Errorf("fetch Devin credential %s: %w", path, errDo)
+	}
+	defer func() {
+		if errClose := response.Body.Close(); errClose != nil {
+			log.Errorf("devin executor: close credential response body: %v", errClose)
+		}
+	}()
+	payload, errRead := io.ReadAll(io.LimitReader(response.Body, 4<<20))
+	if errRead != nil {
+		return nil, fmt.Errorf("read Devin credential response %s: %w", path, errRead)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, newDevinStatusError(response.StatusCode, response.Header, payload)
+	}
+	return payload, nil
+}
+
 // Refresh updates Devin user status, plan, and quota signals.
 func (e *DevinExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	if auth == nil {
@@ -150,7 +210,7 @@ func (e *DevinExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		return auth, nil
 	}
 
-	httpClient := helps.NewDevinHTTPClient(ctx, e.cfg, auth, 30*time.Second)
+	httpClient := helps.NewDevinHTTPClient(ctx, e.cfg, auth, 0)
 	authService := devinauth.NewDevinAuthService(httpClient)
 	if baseURL != "" {
 		authService.SetServerBaseURL(baseURL)
@@ -368,10 +428,29 @@ func (e *DevinExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}, nil
 }
 
+type devinRequestPayload struct {
+	systemPrompt             string
+	prompts                  []helps.DevinPrompt
+	tools                    []helps.DevinTool
+	completion               helps.DevinCompletionConfig
+	toolChoice               helps.DevinToolChoice
+	disableParallelToolCalls bool
+	sessionID                string
+	cascadeID                string
+	thinkingLevel            string
+}
+
 func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*http.Request, string, []byte, error) {
 	apiKey, baseURL, deviceSeed := devinAuthCredentials(auth)
 	if apiKey == "" {
 		return nil, "", nil, fmt.Errorf("devin credentials missing: api_key or session_token required")
+	}
+	userJWT, errAuth := e.fetchDevinUserJWT(ctx, auth, apiKey, baseURL, deviceSeed)
+	if errAuth != nil {
+		return nil, "", nil, errAuth
+	}
+	if userJWT.CustomBaseURL != "" {
+		baseURL = userJWT.CustomBaseURL
 	}
 
 	payload := req.Payload
@@ -379,37 +458,60 @@ func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *clipr
 	if !isInteractionsSource {
 		payload = sdktranslator.TranslateRequest(opts.SourceFormat, sdktranslator.FormatInteractions, req.Model, payload, opts.Stream)
 	}
-	systemPrompt, prompts, tools, temp, maxTokens, sessionID, cascadeID, thinkingLevel, budgetTokens := parseInteractionsPayload(payload, opts.OriginalRequest)
-	sessionID, cascadeID = resolveDevinSessionAndCascadeIDs(ctx, sessionID, cascadeID, opts)
+	baseModel := "devin/" + helps.DevinCatalogModelUID(req.Model)
+	modelInfo := registry.LookupModelInfo(baseModel, "devin")
+	payload, errThinking := thinking.ApplyThinkingWithModelInfo(payload, req.Payload, req.Model, string(opts.SourceFormat), "devin", "devin", modelInfo)
+	if errThinking != nil {
+		return nil, "", nil, errThinking
+	}
+	parsed := parseInteractionsPayload(payload, opts.OriginalRequest)
+	parsed.sessionID, parsed.cascadeID = resolveDevinSessionAndCascadeIDs(ctx, parsed.sessionID, parsed.cascadeID, opts)
 
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	if modelInfo := registry.LookupModelInfo(baseModel, "devin"); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
-		if maxTokens > modelInfo.MaxCompletionTokens || maxTokens <= 0 {
-			maxTokens = modelInfo.MaxCompletionTokens
+	if modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
+		if parsed.completion.MaxTokens > modelInfo.MaxCompletionTokens || parsed.completion.MaxTokens <= 0 {
+			parsed.completion.MaxTokens = modelInfo.MaxCompletionTokens
 		}
 	}
+	// Upstream only enables parallel tool calls for models that declare
+	// supports_parallel_tool_calls; match the native client and disable them
+	// for every catalog model that does not opt in.
+	if modelInfo != nil && !modelInfo.SupportsParallelToolCalls {
+		parsed.disableParallelToolCalls = true
+	}
 
-	chatModelUID := helps.ResolveDevinChatModelUID(req.Model, thinkingLevel, budgetTokens)
-
+	var assignmentJWT string
+	var chatModelUID string
+	if helps.IsDevinModelRouter(req.Model) {
+		assignment, errAssign := e.assignDevinModel(ctx, auth, apiKey, baseURL, deviceSeed, helps.DevinCatalogModelUID(req.Model), parsed.cascadeID, devinRouterPrompt(parsed.prompts))
+		if errAssign != nil {
+			return nil, "", nil, errAssign
+		}
+		chatModelUID = assignment.ModelUID
+		assignmentJWT = assignment.JWT
+	} else {
+		chatModelUID = helps.ResolveDevinChatModelUID(thinking.ParseSuffix(req.Model).ModelName, parsed.thinkingLevel)
+	}
 	matcher := e.getSensitiveWordMatcher()
+	protoBytes := helps.BuildDevinGetChatMessageRequest(helps.DevinChatRequest{
+		SessionToken:             apiKey,
+		UserJWT:                  userJWT.JWT,
+		DeviceSeed:               deviceSeed,
+		ChatModelUID:             chatModelUID,
+		SystemPrompt:             parsed.systemPrompt,
+		Prompts:                  parsed.prompts,
+		Tools:                    parsed.tools,
+		Completion:               parsed.completion,
+		ToolChoice:               parsed.toolChoice,
+		DisableParallelToolCalls: parsed.disableParallelToolCalls,
+		SessionID:                parsed.sessionID,
+		CascadeID:                parsed.cascadeID,
+		ModelAssignmentJWT:       assignmentJWT,
+		Matcher:                  matcher,
+	})
 
-	protoBytes := helps.BuildDevinGetChatMessageRequest(
-		apiKey,
-		deviceSeed,
-		chatModelUID,
-		systemPrompt,
-		prompts,
-		tools,
-		temp,
-		maxTokens,
-		sessionID,
-		cascadeID,
-		matcher,
-	)
-
-	sanitizedSystemPrompt := systemPrompt
-	if systemPrompt != "" {
-		sanitizedSystemPrompt = helps.SanitizeDevinSystemPrompt(systemPrompt, matcher)
+	sanitizedSystemPrompt := parsed.systemPrompt
+	if parsed.systemPrompt != "" {
+		sanitizedSystemPrompt = helps.SanitizeDevinSystemPrompt(parsed.systemPrompt, matcher)
 	}
 
 	logBody := helps.BuildDevinUpstreamLogBody(
@@ -417,12 +519,12 @@ func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *clipr
 		isInteractionsSource,
 		chatModelUID,
 		sanitizedSystemPrompt,
-		prompts,
-		tools,
-		temp,
-		maxTokens,
-		sessionID,
-		cascadeID,
+		parsed.prompts,
+		parsed.tools,
+		parsed.completion.Temperature,
+		parsed.completion.MaxTokens,
+		parsed.sessionID,
+		parsed.cascadeID,
 	)
 
 	framed := helps.WrapConnectEnvelope(protoBytes)
@@ -442,6 +544,181 @@ func (e *DevinExecutor) prepareDevinHTTPRequest(ctx context.Context, auth *clipr
 
 const maxDevinToolCalls = 128
 
+type devinToolCallState struct {
+	id        string
+	name      string
+	arguments string
+}
+
+type devinToolCallAccumulator struct {
+	calls    map[string]*devinToolCallState
+	order    []string
+	activeID string
+}
+
+func (a *devinToolCallAccumulator) apply(delta helps.DevinToolCallDelta) (*devinToolCallState, string, bool) {
+	id := strings.TrimSpace(delta.ID)
+	if id == "" {
+		id = a.activeID
+	}
+	if id == "" {
+		return nil, "", false
+	}
+	if a.calls == nil {
+		a.calls = make(map[string]*devinToolCallState)
+	}
+	call, exists := a.calls[id]
+	if !exists {
+		if len(a.order) >= maxDevinToolCalls {
+			return nil, "", false
+		}
+		call = &devinToolCallState{id: id}
+		a.calls[id] = call
+		a.order = append(a.order, id)
+	}
+	if delta.ID != "" {
+		a.activeID = id
+	}
+	if delta.Name != "" {
+		call.name = delta.Name
+	}
+	call.arguments, delta.Arguments = mergeDevinToolArguments(call.arguments, delta.Arguments)
+	return call, delta.Arguments, !exists
+}
+
+func (a *devinToolCallAccumulator) list() []helps.DevinToolCall {
+	if len(a.order) == 0 {
+		return nil
+	}
+	calls := make([]helps.DevinToolCall, 0, len(a.order))
+	for _, id := range a.order {
+		call := a.calls[id]
+		if call == nil {
+			continue
+		}
+		calls = append(calls, helps.DevinToolCall{ID: call.id, Name: call.name, Arguments: call.arguments})
+	}
+	return calls
+}
+
+func mergeDevinToolArguments(previous, incoming string) (string, string) {
+	if incoming == "" {
+		return previous, ""
+	}
+	if strings.HasPrefix(incoming, previous) {
+		return incoming, incoming[len(previous):]
+	}
+	return previous + incoming, incoming
+}
+
+func mergeDevinUsage(current, next *helps.DevinUsage) *helps.DevinUsage {
+	if next == nil {
+		return current
+	}
+	if current == nil {
+		current = &helps.DevinUsage{}
+	}
+	if next.InputTokens > 0 {
+		current.InputTokens = next.InputTokens
+	}
+	if next.OutputTokens > 0 {
+		current.OutputTokens = next.OutputTokens
+	}
+	if next.CacheWriteTokens > 0 {
+		current.CacheWriteTokens = next.CacheWriteTokens
+	}
+	if next.CacheReadTokens > 0 {
+		current.CacheReadTokens = next.CacheReadTokens
+	}
+	if next.APIProvider > 0 {
+		current.APIProvider = next.APIProvider
+	}
+	if next.MessageID != "" {
+		current.MessageID = next.MessageID
+	}
+	if next.RequestID != "" {
+		current.RequestID = next.RequestID
+	}
+	if next.ModelUID != "" {
+		current.ModelUID = next.ModelUID
+	}
+	if next.BillingModelUID != "" {
+		current.BillingModelUID = next.BillingModelUID
+	}
+	if next.RequestedModelUID != "" {
+		current.RequestedModelUID = next.RequestedModelUID
+	}
+	if len(next.Headers) > 0 {
+		if current.Headers == nil {
+			current.Headers = make(map[string]string, len(next.Headers))
+		}
+		for key, value := range next.Headers {
+			current.Headers[key] = value
+		}
+	}
+	return current
+}
+
+func applyDevinDimensionUsage(usage *helps.DevinUsage, groups [][]byte) *helps.DevinUsage {
+	if len(groups) == 0 {
+		return usage
+	}
+	input, output, cached, ok := helps.ParseDevinResponseDimensionGroups(groups...)
+	if !ok {
+		return usage
+	}
+	if usage == nil {
+		usage = &helps.DevinUsage{}
+	}
+	if usage.InputTokens == 0 {
+		usage.InputTokens = input
+	}
+	if usage.OutputTokens == 0 {
+		usage.OutputTokens = output
+	}
+	if usage.CacheReadTokens == 0 {
+		usage.CacheReadTokens = cached
+	}
+	return usage
+}
+
+func devinTerminalState(reason uint64, hasToolCalls bool) (string, string) {
+	switch reason {
+	case 1, 9:
+		return "incomplete", "incomplete"
+	case 3:
+		return "incomplete", "max_tokens"
+	case 7, 13:
+		return "failed", "error"
+	case 10:
+		return "completed", "tool_calls"
+	case 11:
+		return "incomplete", "content_filter"
+	}
+	if hasToolCalls {
+		return "completed", "tool_calls"
+	}
+	return "completed", "stop"
+}
+
+func setDevinInteractionsUsage(payload []byte, path string, usage *helps.DevinUsage) []byte {
+	if usage == nil {
+		return payload
+	}
+	totalInput := usage.InputTokens + usage.CacheWriteTokens + usage.CacheReadTokens
+	totalTokens := totalInput + usage.OutputTokens
+	payload, _ = sjson.SetBytes(payload, path+".input_tokens", usage.InputTokens)
+	payload, _ = sjson.SetBytes(payload, path+".output_tokens", usage.OutputTokens)
+	payload, _ = sjson.SetBytes(payload, path+".cached_tokens", usage.CacheReadTokens)
+	payload, _ = sjson.SetBytes(payload, path+".cache_write_tokens", usage.CacheWriteTokens)
+	payload, _ = sjson.SetBytes(payload, path+".total_input_tokens", totalInput)
+	payload, _ = sjson.SetBytes(payload, path+".total_output_tokens", usage.OutputTokens)
+	payload, _ = sjson.SetBytes(payload, path+".total_cached_tokens", usage.CacheReadTokens)
+	payload, _ = sjson.SetBytes(payload, path+".total_cache_write_tokens", usage.CacheWriteTokens)
+	payload, _ = sjson.SetBytes(payload, path+".total_tokens", totalTokens)
+	return payload
+}
+
 func (e *DevinExecutor) streamDevinFrames(
 	ctx context.Context,
 	body io.Reader,
@@ -456,12 +733,8 @@ func (e *DevinExecutor) streamDevinFrames(
 	stepIndex := 0
 	thoughtStarted := false
 	contentStarted := false
-	type devinActiveToolSlot struct {
-		stepIndex int
-		id        string
-		name      string
-	}
-	activeToolSlots := make(map[int]*devinActiveToolSlot)
+	toolCallSteps := make(map[string]int) // maps tool-call ID to step index
+	var toolCalls devinToolCallAccumulator
 	thinkingBuf := &helps.UTF8SplitBuffer{}
 	contentBuf := &helps.UTF8SplitBuffer{}
 	var accumulatedThinking strings.Builder
@@ -469,6 +742,9 @@ func (e *DevinExecutor) streamDevinFrames(
 	var finalUsage *helps.DevinUsage
 	var accumulatedSignature []byte
 	var signatureType string
+	var finalStopReason uint64
+	var responseMessageID string
+	var actualModelUID string
 
 	claudeInputTokens := helps.NewClaudeInputTokenState(opts.SourceFormat, sdktranslator.FormatInteractions, responseFormat, opts.OriginalRequest)
 	var translateParam any
@@ -521,6 +797,9 @@ func (e *DevinExecutor) streamDevinFrames(
 		if err == nil {
 			return
 		}
+		if reporter != nil {
+			reporter.PublishFailure(ctx, err)
+		}
 		select {
 		case out <- cliproxyexecutor.StreamChunk{Err: err}:
 		case <-ctx.Done():
@@ -528,10 +807,18 @@ func (e *DevinExecutor) streamDevinFrames(
 	}
 
 	// 1. Send initial interaction.created event
-	createdEvent, _ := sjson.SetBytes([]byte(`{"event_type":"interaction.created","interaction":{"id":"","model":""}}`), "interaction.id", interactionID)
-	createdEvent, _ = sjson.SetBytes(createdEvent, "interaction.model", req.Model)
-	if !emitInteractionsEvent(createdEvent) {
-		return
+	createdSent := false
+	emitCreated := func() bool {
+		if createdSent {
+			return true
+		}
+		if responseMessageID != "" {
+			interactionID = responseMessageID
+		}
+		createdEvent, _ := sjson.SetBytes([]byte(`{"event_type":"interaction.created","interaction":{"id":"","model":""}}`), "interaction.id", interactionID)
+		createdEvent, _ = sjson.SetBytes(createdEvent, "interaction.model", req.Model)
+		createdSent = emitInteractionsEvent(createdEvent)
+		return createdSent
 	}
 
 	thoughtStepIndex := -1
@@ -573,50 +860,20 @@ func (e *DevinExecutor) streamDevinFrames(
 			continue
 		}
 
-		if frameRes.Usage != nil {
-			if finalUsage == nil {
-				finalUsage = frameRes.Usage
-			} else {
-				if frameRes.Usage.PromptTokens > 0 {
-					finalUsage.PromptTokens = frameRes.Usage.PromptTokens
-				}
-				if frameRes.Usage.CompletionTokens > 0 {
-					finalUsage.CompletionTokens = frameRes.Usage.CompletionTokens
-				}
-				if frameRes.Usage.CachedTokens > 0 {
-					finalUsage.CachedTokens = frameRes.Usage.CachedTokens
-				}
-				if frameRes.Usage.RequestID != "" {
-					finalUsage.RequestID = frameRes.Usage.RequestID
-				}
-				if frameRes.Usage.ModelName != "" {
-					finalUsage.ModelName = frameRes.Usage.ModelName
-				}
-				if len(frameRes.Usage.Headers) > 0 {
-					if finalUsage.Headers == nil {
-						finalUsage.Headers = make(map[string]string, len(frameRes.Usage.Headers))
-					}
-					for hk, hv := range frameRes.Usage.Headers {
-						finalUsage.Headers[hk] = hv
-					}
-				}
-			}
+		finalUsage = mergeDevinUsage(finalUsage, frameRes.Usage)
+		finalUsage = applyDevinDimensionUsage(finalUsage, frameRes.ResponseDimensionGroups)
+		if frameRes.StopReason != 0 {
+			finalStopReason = frameRes.StopReason
 		}
-		if len(frameRes.ResponseDimensionGroups) > 0 && (finalUsage == nil || finalUsage.PromptTokens == 0 || finalUsage.CompletionTokens == 0 || finalUsage.CachedTokens == 0) {
-			if inTok, outTok, cachedTok, ok := helps.ParseDevinResponseDimensionGroups(frameRes.ResponseDimensionGroups...); ok {
-				if finalUsage == nil {
-					finalUsage = &helps.DevinUsage{}
-				}
-				if finalUsage.PromptTokens == 0 {
-					finalUsage.PromptTokens = inTok
-				}
-				if finalUsage.CompletionTokens == 0 {
-					finalUsage.CompletionTokens = outTok
-				}
-				if finalUsage.CachedTokens == 0 {
-					finalUsage.CachedTokens = cachedTok
-				}
-			}
+		if frameRes.MessageID != "" {
+			responseMessageID = frameRes.MessageID
+			interactionID = responseMessageID
+		}
+		if frameRes.ActualModelUID != "" {
+			actualModelUID = frameRes.ActualModelUID
+		}
+		if !emitCreated() {
+			return
 		}
 		if len(frameRes.DeltaSignature) > 0 {
 			accumulatedSignature = append(accumulatedSignature, frameRes.DeltaSignature...)
@@ -711,70 +968,40 @@ func (e *DevinExecutor) streamDevinFrames(
 
 		// Emit tool call deltas
 		for _, tc := range frameRes.ToolCallDeltas {
-			if tc.Index < 0 || tc.Index >= maxDevinToolCalls {
-				log.Warnf("devin executor: tool call index %d out of bounds (max %d), dropping", tc.Index, maxDevinToolCalls)
+			call, argumentsDelta, created := toolCalls.apply(tc)
+			if call == nil {
+				log.Warn("devin executor: tool call delta missing an id or exceeds the call limit, dropping")
 				continue
 			}
-			if thoughtStarted {
-				stopEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.stop","index":0}`), "index", stepIndex)
-				_ = emitInteractionsEvent(stopEvent)
-				thoughtStarted = false
-				stepIndex++
-			}
-			if contentStarted {
-				stopEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.stop","index":0}`), "index", stepIndex)
-				_ = emitInteractionsEvent(stopEvent)
-				contentStarted = false
-				stepIndex++
-			}
-
-			slot, exists := activeToolSlots[tc.Index]
-			if exists && slot.id != "" && tc.ID != "" && tc.ID != slot.id {
-				stopEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.stop","index":0}`), "index", slot.stepIndex)
-				if !emitInteractionsEvent(stopEvent) {
-					return
+			if created {
+				if thoughtStarted {
+					stopEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.stop","index":0}`), "index", stepIndex)
+					_ = emitInteractionsEvent(stopEvent)
+					thoughtStarted = false
+					stepIndex++
 				}
-				exists = false
-			}
-
-			if !exists {
+				if contentStarted {
+					stopEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.stop","index":0}`), "index", stepIndex)
+					_ = emitInteractionsEvent(stopEvent)
+					contentStarted = false
+					stepIndex++
+				}
 				sIdx := stepIndex
 				stepIndex++
-				slot = &devinActiveToolSlot{
-					stepIndex: sIdx,
-					id:        tc.ID,
-					name:      tc.Name,
-				}
-				activeToolSlots[tc.Index] = slot
+				toolCallSteps[call.id] = sIdx
 				startEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.start","index":0,"step":{"type":"function_call","name":"","id":"","call_id":"","arguments":{}}}`), "index", sIdx)
-				startEvent, _ = sjson.SetBytes(startEvent, "step.name", tc.Name)
-				startEvent, _ = sjson.SetBytes(startEvent, "step.id", tc.ID)
-				startEvent, _ = sjson.SetBytes(startEvent, "step.call_id", tc.ID)
+				startEvent, _ = sjson.SetBytes(startEvent, "step.name", call.name)
+				startEvent, _ = sjson.SetBytes(startEvent, "step.id", call.id)
+				startEvent, _ = sjson.SetBytes(startEvent, "step.call_id", call.id)
 				if !emitInteractionsEvent(startEvent) {
 					return
 				}
-			} else {
-				updated := false
-				if slot.id == "" && tc.ID != "" {
-					slot.id = tc.ID
-					updated = true
-				}
-				if slot.name == "" && tc.Name != "" {
-					slot.name = tc.Name
-					updated = true
-				}
-				if updated {
-					updateEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.start","index":0,"step":{"type":"function_call","name":"","id":"","call_id":"","arguments":{}}}`), "index", slot.stepIndex)
-					updateEvent, _ = sjson.SetBytes(updateEvent, "step.name", slot.name)
-					updateEvent, _ = sjson.SetBytes(updateEvent, "step.id", slot.id)
-					updateEvent, _ = sjson.SetBytes(updateEvent, "step.call_id", slot.id)
-					_ = emitInteractionsEvent(updateEvent)
-				}
 			}
 
-			if tc.Arguments != "" {
-				deltaEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.delta","index":0,"delta":{"type":"arguments_delta","arguments":""}}`), "index", slot.stepIndex)
-				deltaEvent, _ = translatorcommon.SetStringWithoutHTMLEscape(deltaEvent, "delta.arguments", tc.Arguments)
+			if argumentsDelta != "" {
+				sIdx := toolCallSteps[call.id]
+				deltaEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.delta","index":0,"delta":{"type":"arguments_delta","arguments":""}}`), "index", sIdx)
+				deltaEvent, _ = translatorcommon.SetStringWithoutHTMLEscape(deltaEvent, "delta.arguments", argumentsDelta)
 				if !emitInteractionsEvent(deltaEvent) {
 					return
 				}
@@ -782,15 +1009,19 @@ func (e *DevinExecutor) streamDevinFrames(
 		}
 	}
 
+	if !emitCreated() {
+		return
+	}
+
 	// 3. Close open steps
 	if thoughtStarted || contentStarted {
 		stopEvent, _ := sjson.SetBytes([]byte(`{"event_type":"step.stop","index":0}`), "index", stepIndex)
 		_ = emitInteractionsEvent(stopEvent)
 	}
-	if len(activeToolSlots) > 0 {
-		sortedIndices := make([]int, 0, len(activeToolSlots))
-		for _, slot := range activeToolSlots {
-			sortedIndices = append(sortedIndices, slot.stepIndex)
+	if len(toolCallSteps) > 0 {
+		sortedIndices := make([]int, 0, len(toolCallSteps))
+		for _, sIdx := range toolCallSteps {
+			sortedIndices = append(sortedIndices, sIdx)
 		}
 		sort.Ints(sortedIndices)
 		for _, sIdx := range sortedIndices {
@@ -820,29 +1051,30 @@ func (e *DevinExecutor) streamDevinFrames(
 	}
 
 	// 5. Emit interaction.completed with final usage
-	completedEvent := []byte(`{"event_type":"interaction.completed","interaction":{"id":"","model":"","status":"completed","usage":{"total_input_tokens":0,"total_output_tokens":0,"total_cached_tokens":0}}}`)
+	status, stopReason := devinTerminalState(finalStopReason, len(toolCallSteps) > 0)
+	if status == "failed" {
+		errGeneration := statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("devin generation failed (stop reason %d)", finalStopReason)}
+		helps.RecordAPIResponseError(ctx, e.cfg, errGeneration)
+		emitStreamError(errGeneration)
+		return
+	}
+	completedEvent := []byte(`{"event_type":"interaction.completed","interaction":{"id":"","model":"","status":"completed","stop_reason":"stop","usage":{}}}`)
 	completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.id", interactionID)
 	completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.model", req.Model)
-	if finalUsage != nil {
-		totalInput := finalUsage.PromptTokens + finalUsage.CachedTokens
-		totalOutput := finalUsage.CompletionTokens
-		totalTokens := totalInput + totalOutput
-
-		completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.usage.total_input_tokens", totalInput)
-		completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.usage.total_output_tokens", totalOutput)
-		completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.usage.total_cached_tokens", finalUsage.CachedTokens)
-		completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.usage.total_tokens", totalTokens)
-		if detail, ok := helps.ParseInteractionsStreamUsage(completedEvent); ok {
-			if reporter != nil {
-				reporter.Publish(ctx, detail)
-			}
-		}
+	completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.status", status)
+	completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.stop_reason", stopReason)
+	if actualModelUID != "" {
+		completedEvent, _ = sjson.SetBytes(completedEvent, "interaction.upstream_model", actualModelUID)
+	}
+	completedEvent = setDevinInteractionsUsage(completedEvent, "interaction.usage", finalUsage)
+	if detail, ok := helps.ParseInteractionsStreamUsage(completedEvent); ok && reporter != nil {
+		reporter.Publish(ctx, detail)
 	}
 	_ = emitInteractionsEvent(completedEvent)
 
 	if finalUsage != nil || len(accumulatedSignature) > 0 {
 		streamSummary := &helps.DevinUpstreamResponseLog{
-			Status:        "completed",
+			Status:        status,
 			FramesCount:   streamFrameCount,
 			Thinking:      accumulatedThinking.String(),
 			Content:       accumulatedContent.String(),
@@ -886,39 +1118,17 @@ func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string
 	interactionID := fmt.Sprintf("interaction_%s", uuid.New().String()[:12])
 	var textParts []string
 	var thinkingParts []string
-	type devinToolCallBuilder struct {
-		id   string
-		name string
-		args strings.Builder
-	}
-	var toolBuilders []*devinToolCallBuilder
-	slotToBuilderIndex := make(map[int]int)
-
+	var toolAccumulator devinToolCallAccumulator
 	getToolCalls := func() []helps.DevinToolCall {
-		if len(toolBuilders) == 0 {
-			return nil
-		}
-		res := make([]helps.DevinToolCall, 0, len(toolBuilders))
-		for i := range toolBuilders {
-			if toolBuilders[i] == nil {
-				continue
-			}
-			// Skip unpopulated sparse placeholders
-			if toolBuilders[i].id == "" && toolBuilders[i].name == "" && toolBuilders[i].args.Len() == 0 {
-				continue
-			}
-			res = append(res, helps.DevinToolCall{
-				ID:        toolBuilders[i].id,
-				Name:      toolBuilders[i].name,
-				Arguments: toolBuilders[i].args.String(),
-			})
-		}
-		return res
+		return toolAccumulator.list()
 	}
 
 	var finalUsage *helps.DevinUsage
 	var accumulatedSignature []byte
 	var signatureType string
+	var finalStopReason uint64
+	var responseMessageID string
+	var actualModelUID string
 	var unknownFields []int
 	seenUnknown := make(map[int]bool)
 	framesCount := 0
@@ -977,50 +1187,16 @@ func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string
 			}
 		}
 
-		if frameRes.Usage != nil {
-			if finalUsage == nil {
-				finalUsage = frameRes.Usage
-			} else {
-				if frameRes.Usage.PromptTokens > 0 {
-					finalUsage.PromptTokens = frameRes.Usage.PromptTokens
-				}
-				if frameRes.Usage.CompletionTokens > 0 {
-					finalUsage.CompletionTokens = frameRes.Usage.CompletionTokens
-				}
-				if frameRes.Usage.CachedTokens > 0 {
-					finalUsage.CachedTokens = frameRes.Usage.CachedTokens
-				}
-				if frameRes.Usage.RequestID != "" {
-					finalUsage.RequestID = frameRes.Usage.RequestID
-				}
-				if frameRes.Usage.ModelName != "" {
-					finalUsage.ModelName = frameRes.Usage.ModelName
-				}
-				if len(frameRes.Usage.Headers) > 0 {
-					if finalUsage.Headers == nil {
-						finalUsage.Headers = make(map[string]string, len(frameRes.Usage.Headers))
-					}
-					for hk, hv := range frameRes.Usage.Headers {
-						finalUsage.Headers[hk] = hv
-					}
-				}
-			}
+		finalUsage = mergeDevinUsage(finalUsage, frameRes.Usage)
+		finalUsage = applyDevinDimensionUsage(finalUsage, frameRes.ResponseDimensionGroups)
+		if frameRes.StopReason != 0 {
+			finalStopReason = frameRes.StopReason
 		}
-		if len(frameRes.ResponseDimensionGroups) > 0 && (finalUsage == nil || finalUsage.PromptTokens == 0 || finalUsage.CompletionTokens == 0 || finalUsage.CachedTokens == 0) {
-			if inTok, outTok, cachedTok, ok := helps.ParseDevinResponseDimensionGroups(frameRes.ResponseDimensionGroups...); ok {
-				if finalUsage == nil {
-					finalUsage = &helps.DevinUsage{}
-				}
-				if finalUsage.PromptTokens == 0 {
-					finalUsage.PromptTokens = inTok
-				}
-				if finalUsage.CompletionTokens == 0 {
-					finalUsage.CompletionTokens = outTok
-				}
-				if finalUsage.CachedTokens == 0 {
-					finalUsage.CachedTokens = cachedTok
-				}
-			}
+		if frameRes.MessageID != "" {
+			responseMessageID = frameRes.MessageID
+		}
+		if frameRes.ActualModelUID != "" {
+			actualModelUID = frameRes.ActualModelUID
 		}
 		if len(frameRes.DeltaSignature) > 0 {
 			accumulatedSignature = append(accumulatedSignature, frameRes.DeltaSignature...)
@@ -1035,32 +1211,8 @@ func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string
 			textParts = append(textParts, frameRes.ContentText)
 		}
 		for _, tc := range frameRes.ToolCallDeltas {
-			slotIdx := tc.Index
-			if slotIdx < 0 || slotIdx >= maxDevinToolCalls {
-				log.Warnf("devin executor: tool call index %d out of bounds (max %d), dropping", slotIdx, maxDevinToolCalls)
-				continue
-			}
-			bIdx, exists := slotToBuilderIndex[slotIdx]
-			if exists && tc.ID != "" && toolBuilders[bIdx].id != "" && tc.ID != toolBuilders[bIdx].id {
-				exists = false
-			}
-			if !exists {
-				if len(toolBuilders) >= maxDevinToolCalls {
-					log.Warnf("devin executor: total tool calls exceeded max %d, dropping", maxDevinToolCalls)
-					continue
-				}
-				bIdx = len(toolBuilders)
-				toolBuilders = append(toolBuilders, &devinToolCallBuilder{})
-				slotToBuilderIndex[slotIdx] = bIdx
-			}
-			if tc.ID != "" {
-				toolBuilders[bIdx].id = tc.ID
-			}
-			if tc.Name != "" {
-				toolBuilders[bIdx].name = tc.Name
-			}
-			if tc.Arguments != "" {
-				toolBuilders[bIdx].args.WriteString(tc.Arguments)
+			if call, _, _ := toolAccumulator.apply(tc); call == nil {
+				log.Warn("devin executor: tool call delta missing an id or exceeds the call limit, dropping")
 			}
 		}
 	}
@@ -1083,9 +1235,18 @@ func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string
 		return nil, respLog, truncErr
 	}
 
-	out := []byte(`{"id":"","model":"","status":"completed","steps":[],"usage":{"total_input_tokens":0,"total_output_tokens":0,"total_cached_tokens":0}}`)
+	if responseMessageID != "" {
+		interactionID = responseMessageID
+	}
+	status, stopReason := devinTerminalState(finalStopReason, len(toolCalls) > 0)
+	out := []byte(`{"id":"","model":"","status":"completed","stop_reason":"stop","steps":[],"usage":{}}`)
 	out, _ = sjson.SetBytes(out, "id", interactionID)
 	out, _ = sjson.SetBytes(out, "model", model)
+	out, _ = sjson.SetBytes(out, "status", status)
+	out, _ = sjson.SetBytes(out, "stop_reason", stopReason)
+	if actualModelUID != "" {
+		out, _ = sjson.SetBytes(out, "upstream_model", actualModelUID)
+	}
 
 	var steps [][]byte
 
@@ -1134,19 +1295,10 @@ func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string
 		out, _ = sjson.SetRawBytes(out, "steps", []byte(stepsRaw.String()))
 	}
 
-	if finalUsage != nil {
-		totalInput := finalUsage.PromptTokens + finalUsage.CachedTokens
-		totalOutput := finalUsage.CompletionTokens
-		totalTokens := totalInput + totalOutput
-
-		out, _ = sjson.SetBytes(out, "usage.total_input_tokens", totalInput)
-		out, _ = sjson.SetBytes(out, "usage.total_output_tokens", totalOutput)
-		out, _ = sjson.SetBytes(out, "usage.total_cached_tokens", finalUsage.CachedTokens)
-		out, _ = sjson.SetBytes(out, "usage.total_tokens", totalTokens)
-	}
+	out = setDevinInteractionsUsage(out, "usage", finalUsage)
 
 	respLog := &helps.DevinUpstreamResponseLog{
-		Status:        "completed",
+		Status:        status,
 		FramesCount:   framesCount,
 		Content:       strings.Join(textParts, ""),
 		Thinking:      strings.Join(thinkingParts, ""),
@@ -1157,21 +1309,29 @@ func consumeDevinFramesToInteractions(body io.Reader, model, chatModelUID string
 		UnknownFields: unknownFields,
 	}
 
+	if status == "failed" {
+		return nil, respLog, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("devin generation failed (stop reason %d)", finalStopReason)}
+	}
 	return out, respLog, nil
 }
 
-func parseInteractionsPayload(payload, originalRequest []byte) (
-	systemPrompt string,
-	prompts []helps.DevinPrompt,
-	tools []helps.DevinTool,
-	temperature *float64,
-	maxTokens int,
-	sessionID string,
-	cascadeID string,
-	thinkingLevel string,
-	budgetTokens int,
-) {
+func parseInteractionsPayload(payload, originalRequest []byte) devinRequestPayload {
 	root := gjson.ParseBytes(payload)
+	var systemPrompt string
+	var prompts []helps.DevinPrompt
+	var tools []helps.DevinTool
+	var temperature *float64
+	var firstTemperature *float64
+	var topP *float64
+	var maxTokens int
+	var maxNewlines int
+	var topK int
+	var stopPatterns []string
+	var toolChoice helps.DevinToolChoice
+	var disableParallelToolCalls bool
+	var sessionID string
+	var cascadeID string
+	var thinkingLevel string
 
 	// 1. System prompt
 	systemPrompt = strings.TrimSpace(root.Get("system_instruction").String())
@@ -1185,22 +1345,49 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 		genCfg = root.Get("generationConfig")
 	}
 	if genCfg.Exists() {
-		if t := genCfg.Get("temperature"); t.Exists() {
-			val := t.Float()
-			temperature = &val
+		if value := genCfg.Get("temperature"); value.Exists() {
+			parsedValue := value.Float()
+			temperature = &parsedValue
 		}
-		maxTokens = int(genCfg.Get("max_output_tokens").Int())
+		if value := genCfg.Get("first_temperature"); value.Exists() {
+			parsedValue := value.Float()
+			firstTemperature = &parsedValue
+		}
+		if value := firstExistingResult(genCfg.Get("top_p"), genCfg.Get("topP")); value.Exists() {
+			parsedValue := value.Float()
+			topP = &parsedValue
+		}
+		maxTokens = int(firstExistingResult(genCfg.Get("max_output_tokens"), genCfg.Get("maxOutputTokens")).Int())
+		maxNewlines = int(firstExistingResult(genCfg.Get("max_newlines"), genCfg.Get("maxNewlines")).Int())
+		topK = int(firstExistingResult(genCfg.Get("top_k"), genCfg.Get("topK")).Int())
+		stopPatterns = parseDevinStringList(firstExistingResult(genCfg.Get("stop_sequences"), genCfg.Get("stopSequences")))
+		toolChoice = parseDevinToolChoice(genCfg.Get("tool_choice"))
 		thinkingLevel = genCfg.Get("thinking_level").String()
-		budgetTokens = int(genCfg.Get("thinking_config.thinking_budget").Int())
 	}
+	originalRoot := gjson.ParseBytes(originalRequest)
 	if temperature == nil {
-		if origRoot := gjson.ParseBytes(originalRequest); origRoot.Get("temperature").Exists() {
-			val := origRoot.Get("temperature").Float()
-			temperature = &val
-		} else if root.Get("temperature").Exists() {
-			val := root.Get("temperature").Float()
-			temperature = &val
+		if value := firstExistingResult(originalRoot.Get("temperature"), root.Get("temperature")); value.Exists() {
+			parsedValue := value.Float()
+			temperature = &parsedValue
 		}
+	}
+	if topP == nil {
+		if value := firstExistingResult(originalRoot.Get("top_p"), root.Get("top_p")); value.Exists() {
+			parsedValue := value.Float()
+			topP = &parsedValue
+		}
+	}
+	if maxTokens <= 0 {
+		maxTokens = int(firstExistingResult(originalRoot.Get("max_output_tokens"), originalRoot.Get("max_completion_tokens"), originalRoot.Get("max_tokens")).Int())
+	}
+	if len(stopPatterns) == 0 {
+		stopPatterns = parseDevinStringList(firstExistingResult(originalRoot.Get("stop_sequences"), originalRoot.Get("stop"), root.Get("stop")))
+	}
+	if toolChoice.OptionName == "" && toolChoice.ToolName == "" {
+		toolChoice = parseDevinToolChoice(firstExistingResult(root.Get("tool_choice"), originalRoot.Get("tool_choice")))
+	}
+	if parallel := firstExistingResult(root.Get("parallel_tool_calls"), originalRoot.Get("parallel_tool_calls")); parallel.Exists() {
+		disableParallelToolCalls = !parallel.Bool()
 	}
 	if maxTokens <= 0 {
 		maxTokens = helps.DevinDefaultMaxTokens
@@ -1217,12 +1404,11 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 		root.Get("previous_interaction_id").String(),
 	))
 	if sessionID == "" && len(originalRequest) > 0 {
-		origRoot := gjson.ParseBytes(originalRequest)
 		sessionID = strings.TrimSpace(firstNonEmpty(
-			origRoot.Get("session_id").String(),
-			origRoot.Get("sessionId").String(),
-			origRoot.Get("conversation_id").String(),
-			origRoot.Get("previous_interaction_id").String(),
+			originalRoot.Get("session_id").String(),
+			originalRoot.Get("sessionId").String(),
+			originalRoot.Get("conversation_id").String(),
+			originalRoot.Get("previous_interaction_id").String(),
 		))
 	}
 	cascadeID = sessionID
@@ -1236,7 +1422,7 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 			case "user_input":
 				text, images := extractInteractionsStepContent(step)
 				prompts = append(prompts, helps.DevinPrompt{
-					MessageID: uuid.New().String(),
+					MessageID: interactionHistoryMessageID(step),
 					Source:    1,
 					Content:   text,
 					Images:    images,
@@ -1245,8 +1431,11 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 			case "model_output":
 				text := extractInteractionsStepText(step)
 				sigStr := firstNonEmpty(step.Get("signature").String(), step.Get("thought_signature").String())
-				sigBytes, sigType := parseSignatureBytes(sigStr)
+				sigBytes, sigType := devinSignatureBytes(sigStr)
 				if len(prompts) > 0 && prompts[len(prompts)-1].Source == 2 {
+					if prompts[len(prompts)-1].MessageID == "" {
+						prompts[len(prompts)-1].MessageID = interactionHistoryMessageID(step)
+					}
 					if prompts[len(prompts)-1].Content != "" {
 						prompts[len(prompts)-1].Content += "\n" + text
 					} else {
@@ -1258,7 +1447,7 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 					}
 				} else {
 					prompts = append(prompts, helps.DevinPrompt{
-						MessageID:     uuid.New().String(),
+						MessageID:     interactionHistoryMessageID(step),
 						Source:        2,
 						Content:       text,
 						Signature:     sigBytes,
@@ -1270,8 +1459,11 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 				// If previous prompt was assistant, attach thinking; otherwise append assistant prompt
 				text := extractInteractionsStepText(step)
 				sigStr := firstNonEmpty(step.Get("signature").String(), step.Get("thought_signature").String())
-				sigBytes, sigType := parseSignatureBytes(sigStr)
+				sigBytes, sigType := devinSignatureBytes(sigStr)
 				if len(prompts) > 0 && prompts[len(prompts)-1].Source == 2 {
+					if prompts[len(prompts)-1].MessageID == "" {
+						prompts[len(prompts)-1].MessageID = interactionHistoryMessageID(step)
+					}
 					if prompts[len(prompts)-1].Thinking != "" {
 						prompts[len(prompts)-1].Thinking += "\n\n" + text
 					} else {
@@ -1283,7 +1475,7 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 					}
 				} else {
 					prompts = append(prompts, helps.DevinPrompt{
-						MessageID:     uuid.New().String(),
+						MessageID:     interactionHistoryMessageID(step),
 						Source:        2,
 						Thinking:      text,
 						Signature:     sigBytes,
@@ -1297,10 +1489,13 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 				args := step.Get("arguments").Raw
 				tc := helps.DevinToolCall{ID: id, Name: name, Arguments: args}
 				if len(prompts) > 0 && prompts[len(prompts)-1].Source == 2 {
+					if prompts[len(prompts)-1].MessageID == "" {
+						prompts[len(prompts)-1].MessageID = interactionHistoryMessageID(step)
+					}
 					prompts[len(prompts)-1].ToolCalls = append(prompts[len(prompts)-1].ToolCalls, tc)
 				} else {
 					prompts = append(prompts, helps.DevinPrompt{
-						MessageID: uuid.New().String(),
+						MessageID: interactionHistoryMessageID(step),
 						Source:    2,
 						ToolCalls: []helps.DevinToolCall{tc},
 					})
@@ -1308,25 +1503,14 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 
 			case "function_result":
 				id := firstNonEmpty(step.Get("id").String(), step.Get("call_id").String())
-				resText := firstNonEmpty(
-					step.Get("result").String(),
-					step.Get("output").String(),
-					step.Get("content").String(),
-				)
-				if resText == "" {
-					if r := step.Get("result"); r.Exists() {
-						resText = r.Raw
-					} else if o := step.Get("output"); o.Exists() {
-						resText = o.Raw
-					} else if c := step.Get("content"); c.Exists() {
-						resText = c.Raw
-					}
-				}
+				resText, images := extractInteractionsStepContent(step)
 				prompts = append(prompts, helps.DevinPrompt{
-					MessageID:  uuid.New().String(),
-					Source:     4,
-					ToolCallID: id,
-					Content:    resText,
+					MessageID:     interactionHistoryMessageID(step),
+					Source:        4,
+					ToolCallID:    id,
+					ToolResultErr: step.Get("is_error").Bool() || step.Get("isError").Bool(),
+					Content:       resText,
+					Images:        images,
 				})
 			}
 		}
@@ -1342,7 +1526,7 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 			case "user":
 				text, images := extractInteractionsStepContent(m)
 				prompts = append(prompts, helps.DevinPrompt{
-					MessageID: uuid.New().String(),
+					MessageID: interactionHistoryMessageID(m),
 					Source:    1,
 					Content:   text,
 					Images:    images,
@@ -1350,27 +1534,20 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 			case "assistant":
 				text := extractInteractionsStepText(m)
 				prompts = append(prompts, helps.DevinPrompt{
-					MessageID: uuid.New().String(),
+					MessageID: interactionHistoryMessageID(m),
 					Source:    2,
 					Content:   text,
 				})
 			case "tool":
 				id := firstNonEmpty(m.Get("tool_call_id").String(), m.Get("id").String())
-				resText := firstNonEmpty(
-					m.Get("content").String(),
-					m.Get("output").String(),
-					m.Get("result").String(),
-				)
-				if resText == "" {
-					if c := m.Get("content"); c.Exists() {
-						resText = c.Raw
-					}
-				}
+				resText, images := extractInteractionsStepContent(m)
 				prompts = append(prompts, helps.DevinPrompt{
-					MessageID:  uuid.New().String(),
-					Source:     4,
-					ToolCallID: id,
-					Content:    resText,
+					MessageID:     interactionHistoryMessageID(m),
+					Source:        4,
+					ToolCallID:    id,
+					ToolResultErr: m.Get("is_error").Bool() || m.Get("isError").Bool(),
+					Content:       resText,
+					Images:        images,
 				})
 			}
 		}
@@ -1393,11 +1570,81 @@ func parseInteractionsPayload(payload, originalRequest []byte) (
 				Name:        name,
 				Description: desc,
 				Parameters:  []byte(params),
+				Strict:      t.Get("strict").Bool(),
 			})
 		}
 	}
 
-	return
+	return devinRequestPayload{
+		systemPrompt:             systemPrompt,
+		prompts:                  prompts,
+		tools:                    tools,
+		completion:               helps.DevinCompletionConfig{MaxTokens: maxTokens, MaxNewlines: maxNewlines, Temperature: temperature, FirstTemperature: firstTemperature, TopK: topK, TopP: topP, StopPatterns: stopPatterns},
+		toolChoice:               toolChoice,
+		disableParallelToolCalls: disableParallelToolCalls,
+		sessionID:                sessionID,
+		cascadeID:                cascadeID,
+		thinkingLevel:            thinkingLevel,
+	}
+}
+
+func firstExistingResult(values ...gjson.Result) gjson.Result {
+	for _, value := range values {
+		if value.Exists() {
+			return value
+		}
+	}
+	return gjson.Result{}
+}
+
+func parseDevinStringList(value gjson.Result) []string {
+	if value.Type == gjson.String {
+		if item := value.String(); item != "" {
+			return []string{item}
+		}
+		return nil
+	}
+	if !value.IsArray() {
+		return nil
+	}
+	items := make([]string, 0, len(value.Array()))
+	for _, entry := range value.Array() {
+		if item := entry.String(); entry.Type == gjson.String && item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func parseDevinToolChoice(value gjson.Result) helps.DevinToolChoice {
+	if !value.Exists() {
+		return helps.DevinToolChoice{}
+	}
+	if value.Type == gjson.String {
+		option := strings.ToLower(strings.TrimSpace(value.String()))
+		if option == "any" {
+			option = "required"
+		}
+		return helps.DevinToolChoice{OptionName: option}
+	}
+	name := firstNonEmpty(value.Get("name").String(), value.Get("function.name").String(), value.Get("tool.name").String())
+	if name != "" {
+		return helps.DevinToolChoice{ToolName: name}
+	}
+	option := strings.ToLower(strings.TrimSpace(value.Get("type").String()))
+	if option == "any" {
+		option = "required"
+	}
+	return helps.DevinToolChoice{OptionName: option}
+}
+
+func interactionHistoryMessageID(value gjson.Result) string {
+	return firstNonEmpty(
+		value.Get("message_id").String(),
+		value.Get("messageId").String(),
+		value.Get("response_id").String(),
+		value.Get("responseId").String(),
+	)
 }
 
 func parseDataURL(raw string) (mimeType string, data string, ok bool) {
@@ -1434,6 +1681,28 @@ func mimeExtension(mime string) string {
 
 func extractInteractionsStepContent(step gjson.Result) (string, []helps.DevinImage) {
 	content := step.Get("content")
+	if step.Get("type").String() == "function_result" || step.Get("role").String() == "tool" {
+		content = firstExistingResult(step.Get("result"), step.Get("output"), content)
+		if content.IsArray() {
+			parts := content.Array()
+			contentBlocks := len(parts) > 0
+			for _, part := range parts {
+				switch part.Get("type").String() {
+				case "text", "image", "input_image", "image_url":
+				default:
+					contentBlocks = false
+				}
+			}
+			if !contentBlocks {
+				return content.Raw, nil
+			}
+		} else if content.Type != gjson.String {
+			return content.Raw, nil
+		}
+	}
+	if content.IsObject() {
+		return content.Raw, nil
+	}
 	var textParts []string
 	var images []helps.DevinImage
 
@@ -1595,6 +1864,18 @@ func supplementImagesFromOriginal(original []byte, prompts []helps.DevinPrompt) 
 	}
 }
 
+// devinSignatureBytes filters out thinking signatures from unrelated providers.
+// Devin only accepts its own opaque signature payloads (e.g. sealed.v1); a
+// Claude/OpenAI/Gemini signature forwarded into chat history is invalid.
+func devinSignatureBytes(sigStr string) ([]byte, string) {
+	sigBytes, sigType := parseSignatureBytes(sigStr)
+	switch sigType {
+	case "anthropic", "openai", "gemini":
+		return nil, ""
+	}
+	return sigBytes, sigType
+}
+
 func parseSignatureBytes(sigStr string) ([]byte, string) {
 	s := strings.TrimSpace(sigStr)
 	if s == "" {
@@ -1705,7 +1986,7 @@ func supplementSignaturesFromOriginal(original []byte, prompts []helps.DevinProm
 				for _, part := range content.Array() {
 					if part.Get("type").String() == "thinking" {
 						if sig := part.Get("signature").String(); sig != "" {
-							bytes, sType := parseSignatureBytes(sig)
+							bytes, sType := devinSignatureBytes(sig)
 							if len(bytes) > 0 {
 								meta.signature = bytes
 								meta.signatureType = sType
@@ -1875,6 +2156,17 @@ func normalizeDevinUUID(raw string) string {
 	}
 	// Deterministically map any non-UUID session string (e.g. lcp:hash, conv:id) to an RFC 4122 UUID v5
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(raw)).String()
+}
+
+func devinRouterPrompt(prompts []helps.DevinPrompt) *helps.DevinPrompt {
+	for i := len(prompts) - 1; i >= 0; i-- {
+		if prompts[i].Source == 1 {
+			prompt := prompts[i]
+			prompt.MessageID = ""
+			return &prompt
+		}
+	}
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {

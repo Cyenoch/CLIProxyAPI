@@ -1,6 +1,21 @@
 {
   "devin": [
     {
+      "id": "adaptive",
+      "object": "model",
+      "type": "devin",
+      "owned_by": "cognition",
+      "display_name": "Adaptive",
+      "is_model_router": true,
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
       "id": "swe-2",
       "object": "model",
       "type": "devin",

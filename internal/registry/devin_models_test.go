@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -31,39 +32,11 @@ func TestValidateDevinModelsJSON(t *testing.T) {
 		}
 	})
 
-	t.Run("valid envelope models", func(t *testing.T) {
-		data := []byte(`{
-			"models": [
-				{
-					"id": "devin/glm-5-2",
-					"display_name": "GLM-5.2"
-				}
-			]
-		}`)
-		models, err := ValidateDevinModelsJSON(data)
-		if err != nil {
-			t.Fatalf("expected valid, got error: %v", err)
+	for _, invalid := range []string{`{"models":[{"id":"swe-2"}]}`, `[{"id":"swe-2"}]`} {
+		if _, err := ValidateDevinModelsJSON([]byte(invalid)); err == nil {
+			t.Errorf("accepted unsupported catalog format: %s", invalid)
 		}
-		if len(models) != 1 || models[0].ID != "devin/glm-5-2" {
-			t.Fatalf("unexpected models: %+v", models)
-		}
-	})
-
-	t.Run("valid direct array", func(t *testing.T) {
-		data := []byte(`[
-			{
-				"id": "devin/deepseek-v4-flash",
-				"display_name": "DeepSeek V4 Flash"
-			}
-		]`)
-		models, err := ValidateDevinModelsJSON(data)
-		if err != nil {
-			t.Fatalf("expected valid, got error: %v", err)
-		}
-		if len(models) != 1 || models[0].ID != "devin/deepseek-v4-flash" {
-			t.Fatalf("unexpected models: %+v", models)
-		}
-	})
+	}
 
 	t.Run("clean id without devin prefix automatically namespaced", func(t *testing.T) {
 		data := []byte(`{
@@ -194,4 +167,77 @@ func TestDevinModelsRemoteFetchFallback(t *testing.T) {
 
 	// Restore original embedded data for following tests
 	_, _ = loadDevinModelsFromBytes(embeddedDevinModelsJSON, "restore-embed")
+}
+
+type devinCatalogTransport struct{}
+
+func (devinCatalogTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: &devinCatalogBody{ctx: req.Context(), Reader: strings.NewReader(`{"devin":[{"id":"updated"}]}`)}, Request: req}, nil
+}
+
+type devinCatalogBody struct {
+	ctx context.Context
+	*strings.Reader
+}
+
+func (b *devinCatalogBody) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return b.Reader.Read(p)
+}
+func (*devinCatalogBody) Close() error { return nil }
+
+func TestDevinCatalogReadsBodyBeforeCancelAndNotifies(t *testing.T) {
+	oldTransport := http.DefaultTransport
+	oldURLs := devinModelsURLs
+	http.DefaultTransport = devinCatalogTransport{}
+	devinModelsURLs = []string{"https://catalog.example/devin_models.json"}
+	t.Cleanup(func() {
+		http.DefaultTransport = oldTransport
+		devinModelsURLs = oldURLs
+		SetModelRefreshCallback(nil)
+		_, _ = loadDevinModelsFromBytes(embeddedDevinModelsJSON, "restore")
+	})
+	var notifications [][]string
+	SetModelRefreshCallback(func(providers []string) { notifications = append(notifications, providers) })
+	notifications = nil
+	tryRefreshDevinModels(context.Background(), "test")
+	if model := LookupDevinModel("updated"); model == nil {
+		t.Fatal("catalog body was canceled before it could be read")
+	}
+	if len(notifications) != 1 || len(notifications[0]) != 1 || notifications[0][0] != "devin" {
+		t.Fatalf("refresh notifications=%v, want [[devin]]", notifications)
+	}
+	tryRefreshDevinModels(context.Background(), "unchanged")
+	if len(notifications) != 1 {
+		t.Fatalf("unchanged catalog triggered refresh: %v", notifications)
+	}
+}
+
+func TestModelCatalogUpdatersProgressIndependently(t *testing.T) {
+	blockedCtx, cancelBlocked := context.WithCancel(context.Background())
+	defer cancelBlocked()
+	started := make(chan struct{})
+	blockedDone := make(chan struct{})
+	go func() {
+		defer close(blockedDone)
+		runModelCatalogUpdater(blockedCtx, func(ctx context.Context, _ string) { close(started); <-ctx.Done() })
+	}()
+	<-started
+	healthyCtx, cancelHealthy := context.WithCancel(context.Background())
+	defer cancelHealthy()
+	healthyDone := make(chan struct{})
+	go func() {
+		defer close(healthyDone)
+		runModelCatalogUpdater(healthyCtx, func(context.Context, string) { cancelHealthy() })
+	}()
+	<-healthyDone
+	select {
+	case <-blockedDone:
+		t.Fatal("unrelated refresh was canceled")
+	default:
+	}
+	cancelBlocked()
+	<-blockedDone
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ type interactionsToClaudeStreamState struct {
 	ToolNames       map[int]string
 	ToolIDs         map[int]string
 	ToolSignatures  map[int]string
+	ToolBlocks      map[int]int
 }
 
 func ConvertInteractionsResponseToClaude(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
@@ -98,9 +100,7 @@ func ConvertInteractionsResponseToClaudeNonStream(_ context.Context, modelName s
 	if len(contentBlocks) > 0 {
 		out = translatorcommon.SetRawArrayItems(out, "content", contentBlocks)
 	}
-	if sawToolCall {
-		out, _ = sjson.SetBytes(out, "stop_reason", "tool_use")
-	}
+	out, _ = sjson.SetBytes(out, "stop_reason", interactionsClaudeStopReason(root, sawToolCall))
 	out = setClaudeUsageFromInteractions(out, "usage", translatorcommon.InteractionsUsage(root))
 	return out
 }
@@ -128,6 +128,10 @@ func convertInteractionsEventToClaude(modelName string, rawJSON []byte, st *inte
 	case "step.delta":
 		return interactionsStepDeltaToClaude(modelName, root, st)
 	case "step.stop":
+		index := int(root.Get("index").Int())
+		if st.StepTypes[index] == "function_call" {
+			return appendClaudeToolBlockStop(nil, index, st)
+		}
 		return appendClaudeContentBlockStop(nil, st)
 	case "interaction.completed", "finish":
 		return appendClaudeMessageDelta(nil, root, st)
@@ -167,14 +171,14 @@ func interactionsStepDeltaToClaude(modelName string, root gjson.Result, st *inte
 		out := appendClaudeMessageStart(nil, st)
 		out = ensureClaudeContentBlock(out, "thinking", st)
 		text := firstNonEmpty(delta.Get("content.text").String(), delta.Get("text").String())
-		return appendClaudeContentDelta(out, "thinking_delta", "thinking", text, st)
+		return appendClaudeContentDelta(out, "thinking_delta", "thinking", text, st.BlockIndex)
 	case "thought_signature":
 		if st.ActiveBlock && st.ActiveBlockType == "thinking" {
-			return appendClaudeContentDelta(nil, "signature_delta", "signature", delta.Get("signature").String(), st)
+			return appendClaudeContentDelta(nil, "signature_delta", "signature", delta.Get("signature").String(), st.BlockIndex)
 		}
 	case "arguments_delta":
 		out := appendClaudeMessageStart(nil, st)
-		if !st.ActiveBlock || st.ActiveBlockType != "tool_use" {
+		if _, exists := st.ToolBlocks[index]; !exists {
 			out = appendClaudeContentBlockStop(out, st)
 			if st.ToolNames[index] == "" {
 				st.ToolNames[index] = root.Get("step.name").String()
@@ -184,12 +188,12 @@ func interactionsStepDeltaToClaude(modelName string, root gjson.Result, st *inte
 			}
 			out = appendClaudeToolBlockStart(out, index, st)
 		}
-		return appendClaudeContentDelta(out, "input_json_delta", "partial_json", delta.Get("arguments").String(), st)
+		return appendClaudeContentDelta(out, "input_json_delta", "partial_json", delta.Get("arguments").String(), st.ToolBlocks[index])
 	default:
 		_ = modelName
 		out := appendClaudeMessageStart(nil, st)
 		out = ensureClaudeContentBlock(out, "text", st)
-		return appendClaudeContentDelta(out, "text_delta", "text", delta.Get("text").String(), st)
+		return appendClaudeContentDelta(out, "text_delta", "text", delta.Get("text").String(), st.BlockIndex)
 	}
 	return nil
 }
@@ -223,6 +227,9 @@ func appendClaudeContentBlockStart(out [][]byte, blockType string, st *interacti
 }
 
 func appendClaudeToolBlockStart(out [][]byte, stepIndex int, st *interactionsToClaudeStreamState) [][]byte {
+	if _, exists := st.ToolBlocks[stepIndex]; exists {
+		return out
+	}
 	out = appendClaudeContentBlockStop(out, st)
 	block := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
 	block, _ = sjson.SetBytes(block, "index", st.BlockIndex)
@@ -231,8 +238,8 @@ func appendClaudeToolBlockStart(out [][]byte, stepIndex int, st *interactionsToC
 	if signature := st.ToolSignatures[stepIndex]; signature != "" {
 		block, _ = sjson.SetBytes(block, "content_block.signature", signature)
 	}
-	st.ActiveBlock = true
-	st.ActiveBlockType = "tool_use"
+	st.ToolBlocks[stepIndex] = st.BlockIndex
+	st.BlockIndex++
 	return append(out, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", block, 3))
 }
 
@@ -243,12 +250,12 @@ func ensureClaudeContentBlock(out [][]byte, blockType string, st *interactionsTo
 	return appendClaudeContentBlockStart(out, blockType, st)
 }
 
-func appendClaudeContentDelta(out [][]byte, deltaType, field, value string, st *interactionsToClaudeStreamState) [][]byte {
+func appendClaudeContentDelta(out [][]byte, deltaType, field, value string, blockIndex int) [][]byte {
 	if value == "" && deltaType != "input_json_delta" {
 		return out
 	}
 	delta := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":""}}`)
-	delta, _ = sjson.SetBytes(delta, "index", st.BlockIndex)
+	delta, _ = sjson.SetBytes(delta, "index", blockIndex)
 	delta, _ = sjson.SetBytes(delta, "delta.type", deltaType)
 	delta, _ = sjson.SetBytes(delta, "delta."+field, value)
 	return append(out, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", delta, 3))
@@ -267,16 +274,37 @@ func appendClaudeContentBlockStop(out [][]byte, st *interactionsToClaudeStreamSt
 	return out
 }
 
+func appendClaudeToolBlockStop(out [][]byte, stepIndex int, st *interactionsToClaudeStreamState) [][]byte {
+	blockIndex, exists := st.ToolBlocks[stepIndex]
+	if !exists {
+		return out
+	}
+	stop, _ := sjson.SetBytes([]byte(`{"type":"content_block_stop"}`), "index", blockIndex)
+	delete(st.ToolBlocks, stepIndex)
+	return append(out, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", stop, 3))
+}
+
+func appendClaudeAllBlocksStop(out [][]byte, st *interactionsToClaudeStreamState) [][]byte {
+	out = appendClaudeContentBlockStop(out, st)
+	steps := make([]int, 0, len(st.ToolBlocks))
+	for step := range st.ToolBlocks {
+		steps = append(steps, step)
+	}
+	sort.Slice(steps, func(i, j int) bool { return st.ToolBlocks[steps[i]] < st.ToolBlocks[steps[j]] })
+	for _, step := range steps {
+		out = appendClaudeToolBlockStop(out, step, st)
+	}
+	return out
+}
+
 func appendClaudeMessageDelta(out [][]byte, root gjson.Result, st *interactionsToClaudeStreamState) [][]byte {
 	if st.Completed {
 		return out
 	}
 	out = appendClaudeMessageStart(out, st)
-	out = appendClaudeContentBlockStop(out, st)
+	out = appendClaudeAllBlocksStop(out, st)
 	payload := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-	if st.SawToolCall {
-		payload, _ = sjson.SetBytes(payload, "delta.stop_reason", "tool_use")
-	}
+	payload, _ = sjson.SetBytes(payload, "delta.stop_reason", interactionsClaudeStopReason(root, st.SawToolCall))
 	payload = setClaudeUsageFromInteractions(payload, "usage", translatorcommon.InteractionsUsage(root))
 	out = append(out, translatorcommon.AppendSSEEventBytes(nil, "message_delta", payload, 3))
 	st.Completed = true
@@ -287,7 +315,7 @@ func appendClaudeMessageStop(out [][]byte, st *interactionsToClaudeStreamState) 
 	if st.Done {
 		return out
 	}
-	out = appendClaudeContentBlockStop(out, st)
+	out = appendClaudeAllBlocksStop(out, st)
 	if !st.Completed {
 		out = appendClaudeMessageDelta(out, gjson.Result{}, st)
 	}
@@ -299,16 +327,45 @@ func appendClaudeMessageStop(out [][]byte, st *interactionsToClaudeStreamState) 
 	return out
 }
 
+func interactionsClaudeStopReason(root gjson.Result, sawToolCall bool) string {
+	switch translatorcommon.InteractionsStopReason(root) {
+	case "max_tokens":
+		return "max_tokens"
+	case "tool_calls", "function_call":
+		return "tool_use"
+	case "content_filter", "error":
+		return "refusal"
+	}
+	if sawToolCall {
+		return "tool_use"
+	}
+	return "end_turn"
+}
+
 func setClaudeUsageFromInteractions(out []byte, path string, usage gjson.Result) []byte {
 	if !usage.Exists() {
 		return out
 	}
-	if v, ok := firstUsageInt(usage, "input_tokens", "total_input_tokens"); ok {
-		out, _ = sjson.SetBytes(out, path+".input_tokens", v)
+	cacheRead, hasCacheRead := firstUsageInt(usage, "cached_tokens", "total_cached_tokens")
+	cacheWrite, hasCacheWrite := firstUsageInt(usage, "cache_write_tokens", "total_cache_write_tokens")
+	input, hasInput := firstUsageInt(usage, "input_tokens")
+	if !hasInput {
+		input, hasInput = firstUsageInt(usage, "total_input_tokens")
+		input = max(0, input-cacheRead-cacheWrite)
+	}
+	if hasInput {
+		out, _ = sjson.SetBytes(out, path+".input_tokens", input)
 	}
 	if v, ok := firstUsageInt(usage, "output_tokens", "total_output_tokens"); ok {
 		out, _ = sjson.SetBytes(out, path+".output_tokens", v)
 	}
+	if hasCacheRead {
+		out, _ = sjson.SetBytes(out, path+".cache_read_input_tokens", cacheRead)
+	}
+	if hasCacheWrite {
+		out, _ = sjson.SetBytes(out, path+".cache_creation_input_tokens", cacheWrite)
+	}
+
 	return out
 }
 
@@ -391,6 +448,9 @@ func firstNonEmpty(values ...string) string {
 }
 
 func (st *interactionsToClaudeStreamState) ensureMaps() {
+	if st.ToolBlocks == nil {
+		st.ToolBlocks = make(map[int]int)
+	}
 	if st.StepTypes == nil {
 		st.StepTypes = make(map[int]string)
 	}

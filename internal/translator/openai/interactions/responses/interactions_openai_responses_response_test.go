@@ -652,6 +652,27 @@ func TestConvertOpenAIResponsesResponseToInteractionsIncompleteTerminal(t *testi
 	})
 }
 
+func TestConvertInteractionsResponseToOpenAIResponsesPreservesIncompleteStatus(t *testing.T) {
+	raw := []byte(`{"id":"interaction_1","model":"gpt-test","status":"incomplete","stop_reason":"max_tokens","steps":[{"type":"model_output","content":[{"type":"text","text":"partial"}]}]}`)
+	out := ConvertInteractionsResponseToOpenAIResponsesNonStream(context.Background(), "gpt-test", nil, nil, raw, nil)
+	if got := gjson.GetBytes(out, "status").String(); got != "incomplete" {
+		t.Fatalf("status = %q, want incomplete. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "incomplete_details.reason").String(); got != "max_output_tokens" {
+		t.Fatalf("incomplete reason = %q, want max_output_tokens. Output: %s", got, string(out))
+	}
+
+	var param any
+	chunks := ConvertInteractionsResponseToOpenAIResponses(context.Background(), "gpt-test", nil, nil, []byte(`data: {"event_type":"interaction.completed","interaction":{"id":"interaction_1","status":"incomplete","stop_reason":"max_tokens"}}`), &param)
+	payload := findResponsesEventPayload(chunks, "response.incomplete")
+	if got := gjson.GetBytes(payload, "response.status").String(); got != "incomplete" {
+		t.Fatalf("stream status = %q, want incomplete. Payload: %s", got, string(payload))
+	}
+	if got := gjson.GetBytes(payload, "response.incomplete_details.reason").String(); got != "max_output_tokens" {
+		t.Fatalf("stream incomplete reason = %q, want max_output_tokens. Payload: %s", got, string(payload))
+	}
+}
+
 func findInteractionsStepDeltaPayload(events [][]byte) []byte {
 	return findInteractionsEventPayload(events, "step.delta")
 }
@@ -935,5 +956,20 @@ func TestConvertInteractionsResponseToOpenAIResponses_LogReplayTwoToolCalls(t *t
 	}
 	if !strings.Contains(bashItem.Get("arguments").String(), "2>&1") {
 		t.Errorf("bash arguments should contain '2>&1': %s", bashItem.Get("arguments").String())
+	}
+}
+
+func TestInteractionsResponsesCacheUsage(t *testing.T) {
+	usage := `{"input_tokens":11,"output_tokens":7,"cached_tokens":100,"cache_write_tokens":13,"total_input_tokens":124,"total_output_tokens":7,"total_tokens":131}`
+	raw := []byte(`{"id":"i1","steps":[],"usage":` + usage + `}`)
+	nonstream := ConvertInteractionsResponseToOpenAIResponsesNonStream(context.Background(), "devin/swe-2", nil, nil, raw, nil)
+	var param any
+	out := ConvertInteractionsResponseToOpenAIResponses(context.Background(), "devin/swe-2", nil, nil, []byte(`data: {"event_type":"interaction.completed","interaction":`+string(raw)+`}`), &param)
+	for _, result := range []gjson.Result{gjson.GetBytes(nonstream, "usage"), gjson.GetBytes(findResponsesEventPayload(out, "response.completed"), "response.usage")} {
+		for path, want := range map[string]int64{"input_tokens": 124, "output_tokens": 7, "total_tokens": 131, "input_tokens_details.cached_tokens": 100} {
+			if got := result.Get(path).Int(); got != want {
+				t.Errorf("%s = %d, want %d; usage=%s", path, got, want, result.Raw)
+			}
+		}
 	}
 }

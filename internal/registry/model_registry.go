@@ -80,6 +80,11 @@ type ModelInfo struct {
 	// SupportsWebSearch indicates this Antigravity model is listed by
 	// fetchAvailableModels.webSearchModelIds and can execute native googleSearch.
 	SupportsWebSearch bool `json:"supports_web_search,omitempty"`
+	IsModelRouter     bool `json:"is_model_router,omitempty"`
+	// SupportsParallelToolCalls indicates the model declared
+	// model_features.supports_parallel_tool_calls upstream; without it the
+	// Devin wire must set disable_parallel_tool_calls.
+	SupportsParallelToolCalls bool `json:"supports_parallel_tool_calls,omitempty"`
 
 	// NativeCapabilities contains internal, static per-model capability metadata.
 	// It is intentionally separate from Antigravity's dynamically probed capability.

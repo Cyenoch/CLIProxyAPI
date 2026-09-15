@@ -3,6 +3,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -35,7 +36,7 @@ func TestConvertClaudeRequestToInteractionsMapsMessagesToolsAndStream(t *testing
 }
 
 func TestConvertClaudeRequestToInteractionsMapsToolUseAndResult(t *testing.T) {
-	raw := []byte(`{"model":"gemini-3.1-flash-lite","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"location":"北京"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"晴"}]}]}`)
+	raw := []byte(`{"model":"gemini-3.1-flash-lite","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"location":"北京"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"晴"}]}]}`)
 	out := ConvertClaudeRequestToInteractions("gemini-3.1-flash-lite", raw, false)
 	if got := gjson.GetBytes(out, "input.0.type").String(); got != "function_call" {
 		t.Fatalf("input.0.type = %q, want function_call. Output: %s", got, string(out))
@@ -57,6 +58,9 @@ func TestConvertClaudeRequestToInteractionsMapsToolUseAndResult(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "input.1.call_id").String(); got != "toolu_1" {
 		t.Fatalf("result call_id = %q, want toolu_1. Output: %s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "input.1.is_error").Bool() {
+		t.Fatalf("tool result error flag missing. Output: %s", string(out))
 	}
 }
 
@@ -218,6 +222,21 @@ func TestConvertInteractionsResponseToClaudeNonStream(t *testing.T) {
 	}
 }
 
+func TestConvertInteractionsResponseToClaudePreservesMaxTokensStopReason(t *testing.T) {
+	raw := []byte(`{"id":"interaction_1","model":"claude-test","status":"incomplete","stop_reason":"max_tokens","steps":[{"type":"model_output","content":[{"type":"text","text":"partial"}]}]}`)
+	out := ConvertInteractionsResponseToClaudeNonStream(context.Background(), "claude-test", nil, nil, raw, nil)
+	if got := gjson.GetBytes(out, "stop_reason").String(); got != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens. Output: %s", got, string(out))
+	}
+
+	var param any
+	chunks := ConvertInteractionsResponseToClaude(context.Background(), "claude-test", nil, nil, []byte(`data: {"event_type":"interaction.completed","interaction":{"id":"interaction_1","status":"incomplete","stop_reason":"max_tokens"}}`), &param)
+	payload := findClaudeEventPayload(chunks, "message_delta")
+	if got := gjson.GetBytes(payload, "delta.stop_reason").String(); got != "max_tokens" {
+		t.Fatalf("stream stop_reason = %q, want max_tokens. Payload: %s", got, string(payload))
+	}
+}
+
 func findClaudeEventPayload(events [][]byte, eventName string) []byte {
 	prefix := []byte("data:")
 	for _, event := range events {
@@ -232,4 +251,73 @@ func findClaudeEventPayload(events [][]byte, eventName string) []byte {
 		}
 	}
 	return nil
+}
+
+func TestConvertInteractionsResponseToClaudeInterleavedTools(t *testing.T) {
+	for _, explicitStops := range []bool{true, false} {
+		t.Run(fmt.Sprint(explicitStops), func(t *testing.T) {
+			chunks := []string{
+				`{"event_type":"step.start","index":0,"step":{"type":"model_output"}}`,
+				`{"event_type":"step.delta","index":0,"delta":{"type":"text","text":"Calling tools"}}`,
+				`{"event_type":"step.stop","index":0}`,
+				`{"event_type":"step.start","index":1,"step":{"type":"function_call","id":"call_a","name":"a"}}`,
+				`{"event_type":"step.delta","index":1,"delta":{"type":"arguments_delta","arguments":"{\"a\":"}}`,
+				`{"event_type":"step.start","index":2,"step":{"type":"function_call","id":"call_b","name":"b"}}`,
+				`{"event_type":"step.delta","index":2,"delta":{"type":"arguments_delta","arguments":"{\"b\":"}}`,
+				`{"event_type":"step.delta","index":1,"delta":{"type":"arguments_delta","arguments":"1}"}}`,
+				`{"event_type":"step.delta","index":2,"delta":{"type":"arguments_delta","arguments":"2}"}}`,
+			}
+			if explicitStops {
+				chunks = append(chunks, `{"event_type":"step.stop","index":2}`, `{"event_type":"step.stop","index":1}`)
+			}
+			chunks = append(chunks, `{"event_type":"interaction.completed"}`, `[DONE]`)
+			var param any
+			starts := map[int]string{}
+			args := map[int]string{}
+			closed := map[int]bool{}
+			for _, chunk := range chunks {
+				for _, event := range ConvertInteractionsResponseToClaude(context.Background(), "devin/swe-2", nil, nil, []byte(chunk), &param) {
+					root := gjson.ParseBytes(interactionsSSEPayload(event))
+					index := int(root.Get("index").Int())
+					switch root.Get("type").String() {
+					case "content_block_start":
+						if _, exists := starts[index]; exists {
+							t.Fatalf("duplicate block %d", index)
+						}
+						starts[index] = root.Get("content_block.id").String()
+					case "content_block_delta":
+						if _, exists := starts[index]; !exists || closed[index] {
+							t.Fatalf("delta outside open block %d: %s", index, event)
+						}
+						args[index] += root.Get("delta.partial_json").String()
+					case "content_block_stop":
+						if _, exists := starts[index]; !exists || closed[index] {
+							t.Fatalf("invalid stop %d", index)
+						}
+						closed[index] = true
+					}
+				}
+			}
+			if len(starts) != 3 || len(closed) != 3 || starts[1] != "call_a" || starts[2] != "call_b" || args[1] != `{"a":1}` || args[2] != `{"b":2}` {
+				t.Fatalf("starts=%v closed=%v arguments=%v", starts, closed, args)
+			}
+		})
+	}
+}
+
+func TestInteractionsClaudeCacheUsage(t *testing.T) {
+	for _, usage := range []string{`{"input_tokens":11,"output_tokens":7,"cached_tokens":100,"cache_write_tokens":13,"total_input_tokens":124,"total_output_tokens":7,"total_tokens":131}`, `{"total_input_tokens":124,"total_output_tokens":7,"total_cached_tokens":100,"total_cache_write_tokens":13,"total_tokens":131}`} {
+		raw := []byte(`{"id":"i1","steps":[],"usage":` + usage + `}`)
+		nonstream := ConvertInteractionsResponseToClaudeNonStream(context.Background(), "devin/swe-2", nil, nil, raw, nil)
+		var param any
+		out := ConvertInteractionsResponseToClaude(context.Background(), "devin/swe-2", nil, nil, []byte(`data: {"event_type":"interaction.completed","interaction":`+string(raw)+`}`), &param)
+		for _, result := range []gjson.Result{gjson.GetBytes(nonstream, "usage"), gjson.GetBytes(findClaudeEventPayload(out, "message_delta"), "usage")} {
+			for path, want := range map[string]int64{"input_tokens": 11, "output_tokens": 7, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 13} {
+				if got := result.Get(path).Int(); got != want {
+					t.Errorf("%s = %d, want %d; usage=%s", path, got, want, result.Raw)
+				}
+			}
+		}
+	}
+
 }

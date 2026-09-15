@@ -223,6 +223,21 @@ func TestConvertInteractionsResponseToOpenAIPreservesNonCollidingAndNonAntigravi
 	}
 }
 
+func TestConvertInteractionsResponseToOpenAIPreservesMaxTokensStopReason(t *testing.T) {
+	raw := []byte(`{"id":"i1","model":"gpt-test","status":"incomplete","stop_reason":"max_tokens","steps":[{"type":"model_output","content":[{"type":"text","text":"partial"}]}]}`)
+	out := ConvertInteractionsResponseToOpenAINonStream(context.Background(), "gpt-test", nil, nil, raw, nil)
+	if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "length" {
+		t.Fatalf("finish_reason = %q, want length. Output: %s", got, string(out))
+	}
+
+	var param any
+	chunks := ConvertInteractionsResponseToOpenAI(context.Background(), "gpt-test", nil, nil, []byte(`data: {"event_type":"interaction.completed","interaction":{"id":"i1","status":"incomplete","stop_reason":"max_tokens"}}`), &param)
+	completed := findOpenAIChatChunkValue(chunks, "choices.0.finish_reason", "length")
+	if len(completed) == 0 {
+		t.Fatalf("stream completion with length finish reason not found: %q", chunks)
+	}
+}
+
 func findInteractionsEventPayload(events [][]byte, eventType string) []byte {
 	for _, event := range events {
 		payload := interactionsSSEPayload(event)
@@ -281,4 +296,19 @@ func findOpenAIChatChunkValue(chunks [][]byte, path, want string) []byte {
 		}
 	}
 	return nil
+}
+
+func TestInteractionsOpenAICacheUsage(t *testing.T) {
+	usage := `{"input_tokens":11,"output_tokens":7,"cached_tokens":100,"cache_write_tokens":13,"total_input_tokens":124,"total_output_tokens":7,"total_tokens":131}`
+	raw := []byte(`{"id":"i1","steps":[],"usage":` + usage + `}`)
+	nonstream := ConvertInteractionsResponseToOpenAINonStream(context.Background(), "devin/swe-2", nil, nil, raw, nil)
+	var param any
+	out := ConvertInteractionsResponseToOpenAI(context.Background(), "devin/swe-2", nil, nil, []byte(`data: {"event_type":"interaction.completed","interaction":`+string(raw)+`}`), &param)
+	for _, result := range []gjson.Result{gjson.GetBytes(nonstream, "usage"), gjson.GetBytes(findOpenAIChatChunk(out, "usage"), "usage")} {
+		for path, want := range map[string]int64{"prompt_tokens": 124, "completion_tokens": 7, "total_tokens": 131, "prompt_tokens_details.cached_tokens": 100} {
+			if got := result.Get(path).Int(); got != want {
+				t.Errorf("%s = %d, want %d; usage=%s", path, got, want, result.Raw)
+			}
+		}
+	}
 }

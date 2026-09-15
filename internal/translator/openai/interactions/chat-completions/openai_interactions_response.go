@@ -93,8 +93,8 @@ func ConvertInteractionsResponseToOpenAINonStream(ctx context.Context, modelName
 	}
 	if sawToolCall {
 		out, _ = sjson.SetBytes(out, "choices.0.message.content", nil)
-		out, _ = sjson.SetBytes(out, "choices.0.finish_reason", "tool_calls")
 	}
+	out, _ = sjson.SetBytes(out, "choices.0.finish_reason", interactionsOpenAIFinishReason(root, sawToolCall))
 	if envID := firstNonEmpty(interaction.Get("environment_id").String(), root.Get("environment_id").String(), interaction.Get("environment.id").String(), root.Get("environment.id").String(), root.Get("interaction.environment_id").String()); envID != "" {
 		out, _ = sjson.SetBytes(out, "environment_id", envID)
 	}
@@ -212,14 +212,25 @@ func appendOpenAIChatCompleted(out [][]byte, root gjson.Result, st *interactions
 	}
 	out = ensureOpenAIChatStarted(out, st)
 	chunk := openAIChatBaseChunk(st)
-	finishReason := "stop"
-	if st.SawToolCall {
-		finishReason = "tool_calls"
-	}
-	chunk, _ = sjson.SetBytes(chunk, "choices.0.finish_reason", finishReason)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.finish_reason", interactionsOpenAIFinishReason(root, st.SawToolCall))
 	chunk = setOpenAIChatUsageFromInteractions(chunk, "usage", translatorcommon.InteractionsUsage(root))
 	st.Completed = true
 	return append(out, chunk)
+}
+
+func interactionsOpenAIFinishReason(root gjson.Result, sawToolCall bool) string {
+	switch translatorcommon.InteractionsStopReason(root) {
+	case "max_tokens":
+		return "length"
+	case "tool_calls", "function_call":
+		return "tool_calls"
+	case "content_filter":
+		return "content_filter"
+	}
+	if sawToolCall {
+		return "tool_calls"
+	}
+	return "stop"
 }
 
 func openAIChatBaseChunk(st *interactionsToOpenAIChatStreamState) []byte {
@@ -279,7 +290,7 @@ func setOpenAIChatUsageFromInteractions(out []byte, path string, usage gjson.Res
 	if !usage.Exists() {
 		return out
 	}
-	if value, ok := interactionsUsageInt(usage, "input_tokens", "total_input_tokens"); ok {
+	if value, ok := interactionsUsageInt(usage, "total_input_tokens", "input_tokens"); ok {
 		out, _ = sjson.SetBytes(out, path+".prompt_tokens", value)
 	}
 	if value, ok := interactionsUsageInt(usage, "output_tokens", "total_output_tokens"); ok {

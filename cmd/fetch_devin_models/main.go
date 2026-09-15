@@ -28,8 +28,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
+	devinauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/devin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -63,6 +63,8 @@ type devinModelJSON struct {
 	DisplayName               string             `json:"display_name"`
 	ContextLength             int                `json:"context_length,omitempty"`
 	MaxCompletionTokens       int                `json:"max_completion_tokens,omitempty"`
+	IsModelRouter             bool               `json:"is_model_router,omitempty"`
+	SupportsParallelToolCalls bool               `json:"supports_parallel_tool_calls,omitempty"`
 	SupportedInputModalities  []string           `json:"supportedInputModalities,omitempty"`
 	SupportedOutputModalities []string           `json:"supportedOutputModalities,omitempty"`
 	Thinking                  *devinThinkingJSON `json:"thinking,omitempty"`
@@ -73,12 +75,15 @@ type devinThinkingJSON struct {
 }
 
 type rawDevinModel struct {
-	UID           string
-	Label         string
-	ContextLength int
-	Multimodal    bool
-	VendorID      uint64
-	EffortTier    string
+	UID             string
+	Label           string
+	ContextLength   int
+	MaxOutputTokens int
+	Multimodal      bool
+	IsModelRouter   bool
+	ParallelTools   bool
+	VendorID        uint64
+	EffortTier      string
 }
 
 func main() {
@@ -216,15 +221,12 @@ func main() {
 }
 
 func fetchRawDevinModels(ctx context.Context, cfg *config.Config, auth *coreauth.Auth, apiKey string) ([]rawDevinModel, error) {
-	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	f1Bytes := helps.BuildDevinClientMetadataBytes(apiKey, "", "")
+	f1Bytes := devinauth.BuildClientMetadataBytes(apiKey, "", "", "")
 	var reqBody []byte
 	reqBody = protowire.AppendTag(reqBody, 1, protowire.BytesType)
 	reqBody = protowire.AppendBytes(reqBody, f1Bytes)
 
-	req, err := http.NewRequestWithContext(fetchCtx, http.MethodPost, devinGetCliModelConfigsURL, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, devinGetCliModelConfigsURL, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -234,7 +236,7 @@ func fetchRawDevinModels(ctx context.Context, cfg *config.Config, auth *coreauth
 	req.Header.Set("Connect-Protocol-Version", "1")
 	req.Header.Set("User-Agent", devinDefaultUserAgent)
 
-	httpClient := helps.NewProxyAwareHTTPClient(fetchCtx, cfg, auth, 30*time.Second)
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 0)
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
@@ -339,11 +341,20 @@ func parseSingleModelConfig(b []byte) rawDevinModel {
 					continue
 				}
 			}
-		case 22: // chat_model_uid
+		case 22: // model_uid
 			if typ == protowire.BytesType {
 				val, mLen := protowire.ConsumeString(b)
 				if mLen >= 0 {
 					m.UID = val
+					b = b[mLen:]
+					continue
+				}
+			}
+		case 23: // model_info
+			if typ == protowire.BytesType {
+				val, mLen := protowire.ConsumeBytes(b)
+				if mLen >= 0 {
+					parseDevinModelInfo(val, &m)
 					b = b[mLen:]
 					continue
 				}
@@ -357,6 +368,84 @@ func parseSingleModelConfig(b []byte) rawDevinModel {
 		b = b[skip:]
 	}
 	return m
+}
+
+// parseDevinModelInfo decodes the ClientModelConfig.model_info submessage.
+// A model is a server-side router when display_option == MODEL_ROUTER (3) or
+// is_model_router is set; routers must be resolved via AssignModel before chat.
+func parseDevinModelInfo(b []byte, m *rawDevinModel) {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			break
+		}
+		b = b[n:]
+
+		if typ == protowire.BytesType && num == 6 {
+			// model_features
+			if val, mLen := protowire.ConsumeBytes(b); mLen >= 0 {
+				m.ParallelTools = parseDevinModelFeatures(val)
+				b = b[mLen:]
+				continue
+			}
+		}
+
+		if typ == protowire.VarintType {
+			switch num {
+			case 13: // max_output_tokens
+				if val, mLen := protowire.ConsumeVarint(b); mLen >= 0 {
+					m.MaxOutputTokens = int(val)
+					b = b[mLen:]
+					continue
+				}
+			case 22: // display_option
+				if val, mLen := protowire.ConsumeVarint(b); mLen >= 0 {
+					if val == 3 {
+						m.IsModelRouter = true
+					}
+					b = b[mLen:]
+					continue
+				}
+			case 25: // is_model_router
+				if val, mLen := protowire.ConsumeVarint(b); mLen >= 0 {
+					m.IsModelRouter = val != 0
+					b = b[mLen:]
+					continue
+				}
+			}
+		}
+
+		skip := protowire.ConsumeFieldValue(num, typ, b)
+		if skip < 0 {
+			break
+		}
+		b = b[skip:]
+	}
+}
+
+// parseDevinModelFeatures decodes ModelFeatures and reports whether the model
+// declared supports_parallel_tool_calls (field 21).
+func parseDevinModelFeatures(b []byte) bool {
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			break
+		}
+		b = b[n:]
+		if num == 21 && typ == protowire.VarintType {
+			val, mLen := protowire.ConsumeVarint(b)
+			if mLen < 0 {
+				break
+			}
+			return val != 0
+		}
+		skip := protowire.ConsumeFieldValue(num, typ, b)
+		if skip < 0 {
+			break
+		}
+		b = b[skip:]
+	}
+	return false
 }
 
 func vendorName(id uint64) string {
@@ -396,7 +485,9 @@ func formatRawModels(raw []rawDevinModel) []devinModelJSON {
 			OwnedBy:                   vendorName(r.VendorID),
 			DisplayName:               r.Label,
 			ContextLength:             r.ContextLength,
-			MaxCompletionTokens:       64000,
+			MaxCompletionTokens:       devinMaxCompletionTokens(r.MaxOutputTokens),
+			IsModelRouter:             r.IsModelRouter,
+			SupportsParallelToolCalls: r.ParallelTools,
 			SupportedInputModalities:  modalities,
 			SupportedOutputModalities: []string{"text"},
 		})
@@ -404,14 +495,24 @@ func formatRawModels(raw []rawDevinModel) []devinModelJSON {
 	return res
 }
 
+func devinMaxCompletionTokens(maxOutputTokens int) int {
+	if maxOutputTokens > 0 {
+		return maxOutputTokens
+	}
+	return 64000
+}
+
 func aggregateModels(raw []rawDevinModel) []devinModelJSON {
 	type aggEntry struct {
-		baseID        string
-		displayName   string
-		vendorID      uint64
-		contextLength int
-		multimodal    bool
-		levels        map[string]struct{}
+		baseID          string
+		displayName     string
+		vendorID        uint64
+		contextLength   int
+		maxOutputTokens int
+		multimodal      bool
+		isModelRouter   bool
+		parallelTools   bool
+		levels          map[string]struct{}
 	}
 
 	knownSuffixes := []string{"-minimal", "-low", "-medium", "-high", "-xhigh", "-max", "-none", "-priority"}
@@ -433,12 +534,15 @@ func aggregateModels(raw []rawDevinModel) []devinModelJSON {
 		entry, exists := grouped[base]
 		if !exists {
 			entry = &aggEntry{
-				baseID:        base,
-				displayName:   cleanDisplayName(r.Label),
-				vendorID:      r.VendorID,
-				contextLength: r.ContextLength,
-				multimodal:    r.Multimodal,
-				levels:        make(map[string]struct{}),
+				baseID:          base,
+				displayName:     cleanDisplayName(r.Label),
+				vendorID:        r.VendorID,
+				contextLength:   r.ContextLength,
+				maxOutputTokens: r.MaxOutputTokens,
+				multimodal:      r.Multimodal,
+				isModelRouter:   r.IsModelRouter,
+				parallelTools:   r.ParallelTools,
+				levels:          make(map[string]struct{}),
 			}
 			grouped[base] = entry
 			order = append(order, base)
@@ -447,8 +551,17 @@ func aggregateModels(raw []rawDevinModel) []devinModelJSON {
 		if r.Multimodal {
 			entry.multimodal = true
 		}
+		if r.IsModelRouter {
+			entry.isModelRouter = true
+		}
+		if r.ParallelTools {
+			entry.parallelTools = true
+		}
 		if r.ContextLength > entry.contextLength {
 			entry.contextLength = r.ContextLength
+		}
+		if r.MaxOutputTokens > entry.maxOutputTokens {
+			entry.maxOutputTokens = r.MaxOutputTokens
 		}
 		if level != "" {
 			entry.levels[level] = struct{}{}
@@ -482,7 +595,9 @@ func aggregateModels(raw []rawDevinModel) []devinModelJSON {
 			OwnedBy:                   vendorName(entry.vendorID),
 			DisplayName:               entry.displayName,
 			ContextLength:             entry.contextLength,
-			MaxCompletionTokens:       64000,
+			MaxCompletionTokens:       devinMaxCompletionTokens(entry.maxOutputTokens),
+			IsModelRouter:             entry.isModelRouter,
+			SupportsParallelToolCalls: entry.parallelTools,
 			SupportedInputModalities:  modalities,
 			SupportedOutputModalities: []string{"text"},
 			Thinking:                  thinking,
