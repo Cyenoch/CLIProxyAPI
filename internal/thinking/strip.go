@@ -35,7 +35,7 @@ func StripThinkingConfig(body []byte, provider string) []byte {
 		paths = []string{"generationConfig.thinkingConfig"}
 	case "antigravity":
 		paths = []string{"request.generationConfig.thinkingConfig"}
-	case "interactions":
+	case "interactions", "devin":
 		paths = []string{
 			"generation_config.thinking_level",
 			"generation_config.thinkingLevel",

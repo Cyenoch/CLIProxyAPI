@@ -26,7 +26,7 @@ func TestConvertInteractionsRequestToOpenAIPreservesExpressibleFields(t *testing
 }
 
 func TestConvertOpenAIRequestToInteractionsMapsMessagesToolsAndStream(t *testing.T) {
-	raw := []byte(`{"model":"gemini-3.1-flash-lite","stream":true,"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"今天北京的天气怎么样？"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}],"tool_choice":"auto","max_completion_tokens":128}`)
+	raw := []byte(`{"model":"gemini-3.1-flash-lite","stream":true,"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"今天北京的天气怎么样？"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"weather","strict":true,"parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}],"tool_choice":"auto","parallel_tool_calls":false,"max_completion_tokens":128,"top_p":0.7,"stop":["END"]}`)
 	out := ConvertOpenAIRequestToInteractions("gemini-3.1-flash-lite", raw, false)
 	if got := gjson.GetBytes(out, "model").String(); got != "gemini-3.1-flash-lite" {
 		t.Fatalf("model = %q, want gemini-3.1-flash-lite. Output: %s", got, string(out))
@@ -52,11 +52,23 @@ func TestConvertOpenAIRequestToInteractionsMapsMessagesToolsAndStream(t *testing
 	if got := gjson.GetBytes(out, "tools.0.parameters.properties.location.type").String(); got != "string" {
 		t.Fatalf("tool schema missing. Output: %s", string(out))
 	}
+	if !gjson.GetBytes(out, "tools.0.strict").Bool() {
+		t.Fatalf("tool strict flag missing. Output: %s", string(out))
+	}
 	if got := gjson.GetBytes(out, "generation_config.tool_choice").String(); got != "auto" {
 		t.Fatalf("tool_choice = %q, want auto. Output: %s", got, string(out))
 	}
 	if got := gjson.GetBytes(out, "generation_config.max_output_tokens").Int(); got != 128 {
 		t.Fatalf("max_output_tokens = %d, want 128. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "generation_config.top_p").Float(); got != 0.7 {
+		t.Fatalf("top_p = %v, want 0.7. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "generation_config.stop_sequences.0").String(); got != "END" {
+		t.Fatalf("stop sequence = %q, want END. Output: %s", got, string(out))
+	}
+	if parallel := gjson.GetBytes(out, "parallel_tool_calls"); !parallel.Exists() || parallel.Bool() {
+		t.Fatalf("parallel_tool_calls = %s, want false. Output: %s", parallel.Raw, string(out))
 	}
 }
 

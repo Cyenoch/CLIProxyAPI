@@ -10,6 +10,7 @@ import (
 // knownDevinSuffixes lists recognized model uid suffixes.
 var knownDevinSuffixes = []string{
 	"-none",
+	"-minimal",
 	"-low",
 	"-medium",
 	"-high",
@@ -41,39 +42,35 @@ func HasDevinEffortSuffix(model string) bool {
 	return false
 }
 
-// NormalizeThinkingLevel converts numeric budgets or loose effort strings to canonical Devin efforts.
-func NormalizeThinkingLevel(level string, budgetTokens int) string {
-	normalized := strings.ToLower(strings.TrimSpace(level))
-	switch normalized {
-	case "minimal", "low", "medium", "high", "xhigh", "max", "fast":
-		return normalized
-	case "none", "off", "disabled":
-		return "none"
-	case "auto", "adaptive":
-		return "high"
+// DevinCatalogModelUID resolves the public model name to the catalog entry used on the wire.
+func DevinCatalogModelUID(rawModel string) string {
+	model := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(rawModel)), "devin/")
+	model = strings.ReplaceAll(thinking.ParseSuffix(model).ModelName, ".", "-")
+	if model == "gemini-3-flash" {
+		return "gemini-3-8-flash"
 	}
-
-	if budgetTokens > 0 {
-		switch {
-		case budgetTokens <= 4096:
-			return "low"
-		case budgetTokens <= 16384:
-			return "medium"
-		case budgetTokens <= 32768:
-			return "high"
-		default:
-			return "max"
+	if registry.LookupDevinModel(model) != nil {
+		return model
+	}
+	for _, suffix := range knownDevinSuffixes {
+		if base, ok := strings.CutSuffix(model, suffix); ok && registry.LookupDevinModel(base) != nil {
+			return base
 		}
 	}
+	return model
+}
 
-	return ""
+// IsDevinModelRouter reports whether the requested model is a server-side router
+// (e.g. "adaptive"). Routers are not valid chat_model_uid values: they must be
+// resolved through AssignModel before GetChatMessage.
+func IsDevinModelRouter(rawModel string) bool {
+	info := registry.LookupDevinModel(DevinCatalogModelUID(rawModel))
+	return info != nil && info.IsModelRouter
 }
 
 // ResolveDevinChatModelUID resolves a model identifier into a valid upstream Devin chat_model_uid.
-// It prioritizes dynamic catalog metadata from devin_models.json, automatically clamps
-// requested efforts to supported levels, applies sensible default efforts for thinking models,
-// and ensures bare non-thinking models remain bare.
-func ResolveDevinChatModelUID(rawModel string, thinkingLevel string, budgetTokens int) string {
+// Effort must already be normalized and validated by the canonical thinking pipeline.
+func ResolveDevinChatModelUID(rawModel string, effort string) string {
 	model := strings.TrimSpace(rawModel)
 	if model == "" {
 		return "swe-2-high"
@@ -90,20 +87,9 @@ func ResolveDevinChatModelUID(rawModel string, thinkingLevel string, budgetToken
 		return cleanModel
 	}
 
-	// 3. Strip CPA colon or parenthesis suffix (suffix overrides body per CPA convention)
-	parsedSuffix := thinking.ParseSuffix(cleanModel)
-	baseModel := strings.TrimSpace(parsedSuffix.ModelName)
-	if parsedSuffix.HasSuffix {
-		thinkingLevel = parsedSuffix.RawSuffix
-	} else if colonIdx := strings.LastIndex(cleanModel, ":"); colonIdx != -1 {
-		baseModel = strings.TrimSpace(cleanModel[:colonIdx])
-		thinkingLevel = strings.TrimSpace(cleanModel[colonIdx+1:])
-	}
-
-	// 4. Normalize requested effort
-	effort := NormalizeThinkingLevel(thinkingLevel, budgetTokens)
+	baseModel := cleanModel
 	lowerBase := strings.ToLower(baseModel)
-	canonicalBase := strings.ReplaceAll(lowerBase, ".", "-")
+	canonicalBase := DevinCatalogModelUID(baseModel)
 
 	// 5. Check special private upstream aliases
 	if alias, exists := specialDevinAliases[canonicalBase]; exists {
@@ -114,9 +100,6 @@ func ResolveDevinChatModelUID(rawModel string, thinkingLevel string, budgetToken
 			return "MODEL_PRIVATE_3"
 		}
 		return "MODEL_PRIVATE_2"
-	}
-	if canonicalBase == "gemini-3-flash" {
-		canonicalBase = "gemini-3-8-flash"
 	}
 
 	// 6. Look up dynamic model metadata from the Devin catalog (devin_models.json)
@@ -157,10 +140,12 @@ func ResolveDevinChatModelUID(rawModel string, thinkingLevel string, budgetToken
 		return canonicalBase
 	}
 
-	// 9. Model has thinking levels: determine default effort and clamp
+	// Select a default variant only when the request leaves effort unspecified.
 	defaultEffort := selectDefaultDevinEffort(canonicalBase, allowedLevels)
-	clamped := clampEffort(effort, allowedLevels, defaultEffort)
-	return canonicalBase + "-" + clamped
+	if effort == "" {
+		effort = defaultEffort
+	}
+	return canonicalBase + "-" + effort
 }
 
 func selectDefaultDevinEffort(baseModel string, levels []string) string {
@@ -206,61 +191,4 @@ func selectDefaultDevinEffort(baseModel string, levels []string) string {
 		return "low"
 	}
 	return levels[0]
-}
-
-var devinStandardLevelOrder = []string{"minimal", "low", "medium", "high", "xhigh", "max"}
-
-func devinLevelIndex(level string) int {
-	lower := strings.ToLower(strings.TrimSpace(level))
-	for i, l := range devinStandardLevelOrder {
-		if l == lower {
-			return i
-		}
-	}
-	return -1
-}
-
-func clampEffort(requested string, allowed []string, defaultEffort string) string {
-	if requested == "" {
-		return defaultEffort
-	}
-	reqLower := strings.ToLower(strings.TrimSpace(requested))
-	for _, a := range allowed {
-		if reqLower == strings.ToLower(strings.TrimSpace(a)) {
-			return a
-		}
-	}
-	if reqLower == "none" {
-		return defaultEffort
-	}
-
-	reqIdx := devinLevelIndex(reqLower)
-	if reqIdx == -1 {
-		return defaultEffort
-	}
-
-	bestMatch := defaultEffort
-	bestDist := 999
-	bestIdx := -1
-	for _, a := range allowed {
-		aIdx := devinLevelIndex(a)
-		if aIdx == -1 {
-			continue
-		}
-		dist := reqIdx - aIdx
-		if dist < 0 {
-			dist = -dist
-		}
-		if dist < bestDist {
-			bestDist = dist
-			bestMatch = a
-			bestIdx = aIdx
-		} else if dist == bestDist && aIdx > bestIdx {
-			// On tie, prefer the higher effort (e.g. medium -> high for glm-5-3; xhigh -> max for swe-2)
-			bestMatch = a
-			bestIdx = aIdx
-		}
-	}
-
-	return bestMatch
 }

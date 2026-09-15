@@ -89,6 +89,7 @@ func ConvertInteractionsResponseToOpenAIResponsesNonStream(ctx context.Context, 
 	out := []byte(`{"id":"","object":"response","status":"completed","model":"","output":[]}`)
 	out, _ = sjson.SetBytes(out, "id", firstNonEmpty(root.Get("id").String(), root.Get("interaction.id").String()))
 	out, _ = sjson.SetBytes(out, "model", responseModel(modelName, root))
+	out, _ = setResponsesStatusFromInteractions(out, "", root)
 	steps := root.Get("steps")
 	if !steps.Exists() {
 		steps = root.Get("interaction.steps")
@@ -391,6 +392,36 @@ func interactionsStepStopToResponses(root gjson.Result, st *interactionsToRespon
 	}
 }
 
+func setResponsesStatusFromInteractions(payload []byte, path string, root gjson.Result) ([]byte, string) {
+	status := "completed"
+	reason := ""
+	switch translatorcommon.InteractionsStopReason(root) {
+	case "max_tokens":
+		status = "incomplete"
+		reason = "max_output_tokens"
+	case "content_filter":
+		status = "incomplete"
+		reason = "content_filter"
+	case "error":
+		status = "failed"
+	}
+	switch translatorcommon.InteractionsStatus(root) {
+	case "incomplete":
+		status = "incomplete"
+	case "failed":
+		status = "failed"
+	}
+	eventName := "response." + status
+	payload, _ = sjson.SetBytes(payload, path+"status", status)
+	if path != "" {
+		payload, _ = sjson.SetBytes(payload, "type", eventName)
+	}
+	if status == "incomplete" && reason != "" {
+		payload, _ = sjson.SetBytes(payload, path+"incomplete_details.reason", reason)
+	}
+	return payload, eventName
+}
+
 func responsesCompletedEvent(modelName string, root gjson.Result, st *interactionsToResponsesStreamState) []byte {
 	payload := []byte(`{"type":"response.completed","response":{"id":"","object":"response","status":"completed","model":"","output":[],"usage":{}}}`)
 	payload, _ = sjson.SetBytes(payload, "sequence_number", nextResponsesSeq(st))
@@ -406,7 +437,8 @@ func responsesCompletedEvent(modelName string, root gjson.Result, st *interactio
 	}
 	payload = setResponsesCompletedOutput(payload, st)
 	payload = setResponsesUsageFromInteractions(payload, "response.usage", translatorcommon.InteractionsUsage(root))
-	return emitResponsesEvent("response.completed", payload)
+	payload, eventName := setResponsesStatusFromInteractions(payload, "response.", root)
+	return emitResponsesEvent(eventName, payload)
 }
 
 func interactionsThoughtSignature(step gjson.Result) string {

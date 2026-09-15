@@ -35,7 +35,7 @@ func TestConvertClaudeRequestToInteractionsMapsMessagesToolsAndStream(t *testing
 }
 
 func TestConvertClaudeRequestToInteractionsMapsToolUseAndResult(t *testing.T) {
-	raw := []byte(`{"model":"gemini-3.1-flash-lite","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"location":"北京"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"晴"}]}]}`)
+	raw := []byte(`{"model":"gemini-3.1-flash-lite","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"location":"北京"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"晴"}]}]}`)
 	out := ConvertClaudeRequestToInteractions("gemini-3.1-flash-lite", raw, false)
 	if got := gjson.GetBytes(out, "input.0.type").String(); got != "function_call" {
 		t.Fatalf("input.0.type = %q, want function_call. Output: %s", got, string(out))
@@ -48,6 +48,9 @@ func TestConvertClaudeRequestToInteractionsMapsToolUseAndResult(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "input.1.result").String(); got != "晴" {
 		t.Fatalf("result = %q, want 晴. Output: %s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "input.1.is_error").Bool() {
+		t.Fatalf("tool result error flag missing. Output: %s", string(out))
 	}
 }
 
@@ -206,6 +209,21 @@ func TestConvertInteractionsResponseToClaudeNonStream(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "usage.input_tokens").Int(); got != 3 {
 		t.Fatalf("input_tokens = %d, want 3. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertInteractionsResponseToClaudePreservesMaxTokensStopReason(t *testing.T) {
+	raw := []byte(`{"id":"interaction_1","model":"claude-test","status":"incomplete","stop_reason":"max_tokens","steps":[{"type":"model_output","content":[{"type":"text","text":"partial"}]}]}`)
+	out := ConvertInteractionsResponseToClaudeNonStream(context.Background(), "claude-test", nil, nil, raw, nil)
+	if got := gjson.GetBytes(out, "stop_reason").String(); got != "max_tokens" {
+		t.Fatalf("stop_reason = %q, want max_tokens. Output: %s", got, string(out))
+	}
+
+	var param any
+	chunks := ConvertInteractionsResponseToClaude(context.Background(), "claude-test", nil, nil, []byte(`data: {"event_type":"interaction.completed","interaction":{"id":"interaction_1","status":"incomplete","stop_reason":"max_tokens"}}`), &param)
+	payload := findClaudeEventPayload(chunks, "message_delta")
+	if got := gjson.GetBytes(payload, "delta.stop_reason").String(); got != "max_tokens" {
+		t.Fatalf("stream stop_reason = %q, want max_tokens. Payload: %s", got, string(payload))
 	}
 }
 

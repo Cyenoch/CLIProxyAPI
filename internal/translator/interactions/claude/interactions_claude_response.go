@@ -98,9 +98,7 @@ func ConvertInteractionsResponseToClaudeNonStream(_ context.Context, modelName s
 	if len(contentBlocks) > 0 {
 		out = translatorcommon.SetRawArrayItems(out, "content", contentBlocks)
 	}
-	if sawToolCall {
-		out, _ = sjson.SetBytes(out, "stop_reason", "tool_use")
-	}
+	out, _ = sjson.SetBytes(out, "stop_reason", interactionsClaudeStopReason(root, sawToolCall))
 	out = setClaudeUsageFromInteractions(out, "usage", translatorcommon.InteractionsUsage(root))
 	return out
 }
@@ -274,9 +272,7 @@ func appendClaudeMessageDelta(out [][]byte, root gjson.Result, st *interactionsT
 	out = appendClaudeMessageStart(out, st)
 	out = appendClaudeContentBlockStop(out, st)
 	payload := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-	if st.SawToolCall {
-		payload, _ = sjson.SetBytes(payload, "delta.stop_reason", "tool_use")
-	}
+	payload, _ = sjson.SetBytes(payload, "delta.stop_reason", interactionsClaudeStopReason(root, st.SawToolCall))
 	payload = setClaudeUsageFromInteractions(payload, "usage", translatorcommon.InteractionsUsage(root))
 	out = append(out, translatorcommon.AppendSSEEventBytes(nil, "message_delta", payload, 3))
 	st.Completed = true
@@ -297,6 +293,21 @@ func appendClaudeMessageStop(out [][]byte, st *interactionsToClaudeStreamState) 
 	}
 	st.Done = true
 	return out
+}
+
+func interactionsClaudeStopReason(root gjson.Result, sawToolCall bool) string {
+	switch translatorcommon.InteractionsStopReason(root) {
+	case "max_tokens":
+		return "max_tokens"
+	case "tool_calls", "function_call":
+		return "tool_use"
+	case "content_filter", "error":
+		return "refusal"
+	}
+	if sawToolCall {
+		return "tool_use"
+	}
+	return "end_turn"
 }
 
 func setClaudeUsageFromInteractions(out []byte, path string, usage gjson.Result) []byte {

@@ -287,6 +287,10 @@ func claudeToolResultToInteractions(part gjson.Result) []byte {
 					contentPart := []byte(`{"type":"text","text":""}`)
 					contentPart, _ = sjson.SetBytes(contentPart, "text", item.Get("text").String())
 					contentItems = append(contentItems, contentPart)
+				} else if item.Get("type").String() == "image" {
+					if image, ok := claudeMediaPartToInteractions(item, "image"); ok {
+						contentItems = append(contentItems, image)
+					}
 				}
 				return true
 			})
@@ -294,6 +298,9 @@ func claudeToolResultToInteractions(part gjson.Result) []byte {
 		default:
 			step, _ = sjson.SetRawBytes(step, "result", []byte(result.Raw))
 		}
+	}
+	if isError := part.Get("is_error"); isError.Exists() {
+		step, _ = sjson.SetBytes(step, "is_error", isError.Bool())
 	}
 	return step
 }

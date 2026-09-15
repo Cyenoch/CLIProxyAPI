@@ -46,6 +46,12 @@ func ConvertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON 
 			out, _ = sjson.SetRawBytes(out, "generation_config.tool_choice", []byte(toolChoice.Raw))
 		}
 	}
+	copyOptionalRaw(&out, "generation_config.max_output_tokens", firstExisting(root.Get("max_output_tokens"), root.Get("max_tokens"), root.Get("max_completion_tokens")))
+	copyOptionalRaw(&out, "generation_config.temperature", root.Get("temperature"))
+	copyOptionalRaw(&out, "generation_config.top_p", root.Get("top_p"))
+	if parallel := root.Get("parallel_tool_calls"); parallel.Exists() {
+		out, _ = sjson.SetBytes(out, "parallel_tool_calls", parallel.Bool())
+	}
 	if effort := root.Get("reasoning.effort"); effort.Exists() && effort.Type == gjson.String {
 		out, _ = sjson.SetBytes(out, "generation_config.thinking_level", strings.ToLower(strings.TrimSpace(effort.String())))
 	}
@@ -416,6 +422,9 @@ func functionToolToInteractions(tool gjson.Result, forAntigravity bool) ([]byte,
 	out, _ = sjson.SetBytes(out, "name", name)
 	copyOptionalString(&out, "description", firstExisting(tool.Get("description"), tool.Get("function.description")))
 	copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters")))
+	if strict := firstExisting(tool.Get("strict"), tool.Get("function.strict")); strict.Exists() {
+		out, _ = sjson.SetBytes(out, "strict", strict.Bool())
+	}
 	return out, true
 }
 
@@ -431,6 +440,9 @@ func functionDeclarationFromTool(tool gjson.Result, forAntigravity bool) ([]byte
 	out, _ = sjson.SetBytes(out, "name", name)
 	copyOptionalString(&out, "description", firstExisting(tool.Get("description"), tool.Get("function.description")))
 	copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters")))
+	if strict := firstExisting(tool.Get("strict"), tool.Get("function.strict")); strict.Exists() {
+		out, _ = sjson.SetBytes(out, "strict", strict.Bool())
+	}
 	return out, true
 }
 
@@ -640,6 +652,9 @@ func responsesToolFromInteractionsTool(tool gjson.Result, forAntigravity bool) (
 	out, _ = sjson.SetBytes(out, "name", name)
 	copyOptionalString(&out, "description", firstExisting(tool.Get("description"), tool.Get("function.description")))
 	copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters"), tool.Get("parametersJsonSchema")))
+	if strict := firstExisting(tool.Get("strict"), tool.Get("function.strict")); strict.Exists() {
+		out, _ = sjson.SetBytes(out, "strict", strict.Bool())
+	}
 	return out, true
 }
 

@@ -268,6 +268,9 @@ func copyOpenAIChatGenerationConfigToInteractions(out []byte, root gjson.Result,
 	if serviceTier := root.Get("service_tier"); serviceTier.Exists() && serviceTier.Type == gjson.String {
 		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
 	}
+	if parallel := root.Get("parallel_tool_calls"); parallel.Exists() {
+		out, _ = sjson.SetBytes(out, "parallel_tool_calls", parallel.Bool())
+	}
 	return out
 }
 
@@ -307,6 +310,9 @@ func openAIChatToolToInteractions(tool gjson.Result, forAntigravity bool) ([]byt
 	}
 	if parameters := firstExisting(tool.Get("function.parameters"), tool.Get("parameters")); parameters.Exists() {
 		out, _ = sjson.SetRawBytes(out, "parameters", []byte(parameters.Raw))
+	}
+	if strict := firstExisting(tool.Get("function.strict"), tool.Get("strict")); strict.Exists() {
+		out, _ = sjson.SetBytes(out, "strict", strict.Bool())
 	}
 	return out, true
 }

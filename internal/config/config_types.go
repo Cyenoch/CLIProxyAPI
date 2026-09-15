@@ -139,7 +139,7 @@ type XAIConfig struct {
 
 // DevinConfig configures provider-wide Devin request behavior.
 type DevinConfig struct {
-	// SensitiveWords is a list of words to obfuscate with zero-width characters in system prompts and messages.
+	// SensitiveWords is a list of words to obfuscate with zero-width characters in system prompts.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 }
 

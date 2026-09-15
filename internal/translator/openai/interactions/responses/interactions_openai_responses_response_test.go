@@ -651,6 +651,27 @@ func TestConvertOpenAIResponsesResponseToInteractionsIncompleteTerminal(t *testi
 	})
 }
 
+func TestConvertInteractionsResponseToOpenAIResponsesPreservesIncompleteStatus(t *testing.T) {
+	raw := []byte(`{"id":"interaction_1","model":"gpt-test","status":"incomplete","stop_reason":"max_tokens","steps":[{"type":"model_output","content":[{"type":"text","text":"partial"}]}]}`)
+	out := ConvertInteractionsResponseToOpenAIResponsesNonStream(context.Background(), "gpt-test", nil, nil, raw, nil)
+	if got := gjson.GetBytes(out, "status").String(); got != "incomplete" {
+		t.Fatalf("status = %q, want incomplete. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "incomplete_details.reason").String(); got != "max_output_tokens" {
+		t.Fatalf("incomplete reason = %q, want max_output_tokens. Output: %s", got, string(out))
+	}
+
+	var param any
+	chunks := ConvertInteractionsResponseToOpenAIResponses(context.Background(), "gpt-test", nil, nil, []byte(`data: {"event_type":"interaction.completed","interaction":{"id":"interaction_1","status":"incomplete","stop_reason":"max_tokens"}}`), &param)
+	payload := findResponsesEventPayload(chunks, "response.incomplete")
+	if got := gjson.GetBytes(payload, "response.status").String(); got != "incomplete" {
+		t.Fatalf("stream status = %q, want incomplete. Payload: %s", got, string(payload))
+	}
+	if got := gjson.GetBytes(payload, "response.incomplete_details.reason").String(); got != "max_output_tokens" {
+		t.Fatalf("stream incomplete reason = %q, want max_output_tokens. Payload: %s", got, string(payload))
+	}
+}
+
 func findInteractionsStepDeltaPayload(events [][]byte) []byte {
 	return findInteractionsEventPayload(events, "step.delta")
 }

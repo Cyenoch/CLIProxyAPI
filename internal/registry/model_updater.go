@@ -77,40 +77,24 @@ func init() {
 // Safe to call multiple times; only one updater will run.
 func StartModelsUpdater(ctx context.Context) {
 	updaterOnce.Do(func() {
-		go runModelsUpdater(ctx)
+		go runModelCatalogUpdater(ctx, tryRefreshModels)
 	})
 }
 
-func runModelsUpdater(ctx context.Context) {
-	tryStartupRefresh(ctx)
-	periodicRefresh(ctx)
-}
-
-func periodicRefresh(ctx context.Context) {
+// runModelCatalogUpdater shares the refresh lifecycle while allowing each catalog
+// to progress independently. A catalog never overlaps its own in-flight refresh.
+func runModelCatalogUpdater(ctx context.Context, refresh func(context.Context, string)) {
+	refresh(ctx, "startup model refresh")
 	ticker := time.NewTicker(modelsRefreshInterval)
 	defer ticker.Stop()
-	log.Infof("periodic model refresh started (interval=%s)", modelsRefreshInterval)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tryPeriodicRefresh(ctx)
+			refresh(ctx, "periodic model refresh")
 		}
 	}
-}
-
-// tryPeriodicRefresh fetches models from remote, compares with the current
-// catalog, and notifies the registered callback if any provider changed.
-func tryPeriodicRefresh(ctx context.Context) {
-	tryRefreshModels(ctx, "periodic model refresh")
-}
-
-// tryStartupRefresh fetches models from remote in the background during
-// process startup. It uses the same change detection as periodic refresh so
-// existing auth registrations can be updated after the callback is registered.
-func tryStartupRefresh(ctx context.Context) {
-	tryRefreshModels(ctx, "startup model refresh")
 }
 
 func tryRefreshModels(ctx context.Context, label string) {
@@ -142,36 +126,10 @@ func tryRefreshModels(ctx context.Context, label string) {
 // fetchModelsFromRemote tries all remote URLs and returns the parsed model catalog
 // along with the URL it was fetched from. Returns (nil, "") if all fetches fail.
 func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
-	client := &http.Client{Timeout: modelsFetchTimeout}
 	for _, url := range modelsURLs {
-		reqCtx, cancel := context.WithTimeout(ctx, modelsFetchTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
+		data, err := fetchModelCatalog(ctx, url, 8<<20)
 		if err != nil {
-			cancel()
-			log.Debugf("models fetch request creation failed for %s: %v", url, err)
-			continue
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			cancel()
 			log.Debugf("models fetch failed from %s: %v", url, err)
-			continue
-		}
-
-		if resp.StatusCode != 200 {
-			resp.Body.Close()
-			cancel()
-			log.Debugf("models fetch returned %d from %s", resp.StatusCode, url)
-			continue
-		}
-
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		cancel()
-
-		if err != nil {
-			log.Debugf("models fetch read error from %s: %v", url, err)
 			continue
 		}
 
@@ -188,6 +146,34 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 		return &parsed, url
 	}
 	return nil, ""
+}
+
+// fetchModelCatalog reads the response under the caller's cancellation scope.
+func fetchModelCatalog(ctx context.Context, url string, maxSize int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, errDo := http.DefaultClient.Do(req)
+	if errDo != nil {
+		return nil, errDo
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.WithError(errClose).Warn("close model catalog response")
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+	}
+	data, errRead := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
+	if errRead != nil {
+		return nil, errRead
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("model catalog exceeds %d bytes", maxSize)
+	}
+	return data, nil
 }
 
 // detectChangedProviders compares two model catalogs and returns provider names
@@ -217,7 +203,6 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 		{"kimi", oldData.Kimi, newData.Kimi},
 		{"antigravity", oldData.Antigravity, newData.Antigravity},
 		{"xai", oldData.XAI, newData.XAI},
-		{"devin", oldData.Devin, newData.Devin},
 	}
 
 	seen := make(map[string]bool, len(sections))

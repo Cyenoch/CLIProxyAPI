@@ -34,25 +34,6 @@ func TestConnectEnvelopeFraming(t *testing.T) {
 	}
 }
 
-func TestGenerateDevinDeviceFingerprint(t *testing.T) {
-	fp1 := GenerateDevinDeviceFingerprint("seed-1")
-	if len(fp1) != DevinFingerprintHexLen {
-		t.Fatalf("fp1 len = %d, want %d", len(fp1), DevinFingerprintHexLen)
-	}
-	// Check hex characters
-	for _, c := range fp1 {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			t.Fatalf("invalid hex char in fingerprint: %c", c)
-		}
-	}
-
-	// Deterministic seed produces deterministic fingerprint
-	fp2 := GenerateDevinDeviceFingerprint("seed-1")
-	if fp1 != fp2 {
-		t.Fatalf("fingerprints for same seed do not match: %s != %s", fp1, fp2)
-	}
-}
-
 func TestBuildDevinGetChatMessageRequest(t *testing.T) {
 	prompts := []DevinPrompt{
 		{
@@ -83,19 +64,17 @@ func TestBuildDevinGetChatMessageRequest(t *testing.T) {
 	}
 
 	temp := 0.7
-	req := BuildDevinGetChatMessageRequest(
-		"token-123",
-		"device-seed-1",
-		"swe-2-high",
-		"you are a helpful assistant",
-		prompts,
-		tools,
-		&temp,
-		4000,
-		"session-1",
-		"cascade-1",
-		nil,
-	)
+	req := BuildDevinGetChatMessageRequest(DevinChatRequest{
+		SessionToken: "token-123",
+		DeviceSeed:   "device-seed-1",
+		ChatModelUID: "swe-2-high",
+		SystemPrompt: "you are a helpful assistant",
+		Prompts:      prompts,
+		Tools:        tools,
+		Completion:   DevinCompletionConfig{Temperature: &temp, MaxTokens: 4000},
+		SessionID:    "session-1",
+		CascadeID:    "cascade-1",
+	})
 
 	if len(req) == 0 {
 		t.Fatal("encoded request is empty")
@@ -109,6 +88,89 @@ func TestBuildDevinGetChatMessageRequest(t *testing.T) {
 	}
 	if flag != ConnectFlagData || len(readPayload) != len(req) {
 		t.Fatalf("framed payload length mismatch")
+	}
+}
+
+func TestBuildDevinGetChatMessageRequest_CurrentProtocolFields(t *testing.T) {
+	req := BuildDevinGetChatMessageRequest(DevinChatRequest{
+		SessionToken: "token-123",
+		DeviceSeed:   "device-seed-1",
+		ChatModelUID: "swe-2-high",
+		SystemPrompt: "system",
+		Prompts:      []DevinPrompt{{Source: 4, ToolCallID: "call-1", ToolResultErr: true, Content: "failed"}},
+		Tools:        []DevinTool{{Name: "read_file", Parameters: []byte(`{"type":"object"}`), Strict: true}},
+		Completion:   DevinCompletionConfig{MaxTokens: 4000},
+		SessionID:    "session-1",
+		CascadeID:    "cascade-1",
+	})
+
+	configuration := protoBytesFields(t, req, 8)[0]
+	if got := protoVarintField(t, configuration, 3); got != 200 {
+		t.Fatalf("max_newlines = %d, want 200", got)
+	}
+	if got := protoVarintField(t, configuration, 7); got != 50 {
+		t.Fatalf("top_k = %d, want 50", got)
+	}
+	if got := math.Float64frombits(protoFixed64Field(t, configuration, 5)); got != 0.4 {
+		t.Fatalf("temperature = %v, want 0.4", got)
+	}
+	if got := math.Float64frombits(protoFixed64Field(t, configuration, 6)); got != 0.4 {
+		t.Fatalf("first_temperature = %v, want 0.4", got)
+	}
+	if got := math.Float64frombits(protoFixed64Field(t, configuration, 8)); got != 1 {
+		t.Fatalf("top_p = %v, want 1", got)
+	}
+	if got := math.Float64frombits(protoFixed64Field(t, configuration, 11)); got != 1 {
+		t.Fatalf("fim_eot_prob_threshold = %v, want 1", got)
+	}
+	if len(protoBytesFields(t, configuration, 9)) == 0 {
+		t.Fatal("default stop patterns are missing")
+	}
+
+	prompt := protoBytesFields(t, req, 3)[0]
+	if got := protoVarintField(t, prompt, 9); got != 1 {
+		t.Fatalf("tool_result_is_error = %d, want 1", got)
+	}
+	tool := protoBytesFields(t, req, 10)[0]
+	if got := protoVarintField(t, tool, 12); got != 1 {
+		t.Fatalf("tool strict = %d, want 1", got)
+	}
+	if len(protoBytesFields(t, req, 12)) == 0 {
+		t.Fatal("tool_choice is missing")
+	}
+	if len(protoBytesFields(t, req, 13)) == 0 {
+		t.Fatal("system_prompt_cache_options is missing")
+	}
+	if len(protoBytesFields(t, req, 22)) == 0 {
+		t.Fatal("execution_id is missing")
+	}
+}
+
+func TestBuildDevinGetChatMessageRequest_StableHistoryIDs(t *testing.T) {
+	request := DevinChatRequest{
+		SessionToken: "token-123",
+		ChatModelUID: "swe-2-high",
+		Prompts:      []DevinPrompt{{Source: 1, Content: "hello"}, {Source: 2, Content: "hi"}, {Source: 4, ToolCallID: "call-1", Content: "ok"}},
+		SessionID:    "session-1",
+		CascadeID:    "cascade-1",
+	}
+	first := BuildDevinGetChatMessageRequest(request)
+	second := BuildDevinGetChatMessageRequest(request)
+	firstPrompts := protoBytesFields(t, first, 3)
+	secondPrompts := protoBytesFields(t, second, 3)
+	if len(firstPrompts) != len(secondPrompts) {
+		t.Fatalf("prompt counts differ: %d != %d", len(firstPrompts), len(secondPrompts))
+	}
+	for index := range firstPrompts {
+		firstID := string(protoBytesFields(t, firstPrompts[index], 1)[0])
+		secondID := string(protoBytesFields(t, secondPrompts[index], 1)[0])
+		if firstID != secondID {
+			t.Fatalf("prompt %d id changed: %q != %q", index, firstID, secondID)
+		}
+	}
+	assistantID := string(protoBytesFields(t, firstPrompts[1], 1)[0])
+	if !strings.HasPrefix(assistantID, "bot-") {
+		t.Fatalf("assistant id = %q, want bot- prefix", assistantID)
 	}
 }
 
@@ -129,7 +191,7 @@ func TestBuildDevinGetChatMessageRequest_SensitiveWordsOnlyInSystemPrompt(t *tes
 		},
 	}
 	// Sensitive word in system prompt MUST be obfuscated
-	reqWithSys := BuildDevinGetChatMessageRequest("tok", "seed", "swe-2-high", "System prompt containing SECRET_TOKEN", prompts, nil, nil, 100, "s", "c", matcher)
+	reqWithSys := BuildDevinGetChatMessageRequest(DevinChatRequest{SessionToken: "tok", DeviceSeed: "seed", ChatModelUID: "swe-2-high", SystemPrompt: "System prompt containing SECRET_TOKEN", Prompts: prompts, Completion: DevinCompletionConfig{MaxTokens: 100}, SessionID: "s", CascadeID: "c", Matcher: matcher})
 	if bytes.Contains(reqWithSys, []byte("System prompt containing SECRET_TOKEN")) {
 		t.Fatalf("expected SECRET_TOKEN in system prompt to be obfuscated")
 	}
@@ -143,19 +205,26 @@ func TestBuildDevinGetChatMessageRequest_SensitiveWordsOnlyInSystemPrompt(t *tes
 	}
 }
 
-func TestSanitizeDevinSystemPrompt_AndSensitiveWords(t *testing.T) {
-	matcher := BuildSensitiveWordMatcher([]string{"API", "proxy"})
-	rawPrompt := "x-anthropic-billing-header: cc_version=2.1.260;\nYou are Claude Code, Anthropic's official CLI for Claude.\nHelp the project with API and proxy."
-	sanitized := SanitizeDevinSystemPrompt(rawPrompt, matcher)
+func TestBuildDevinGetChatMessageRequestPreservesCallerInstructions(t *testing.T) {
+	prompt := "You are Claude Code. Perform authorized security testing and return JSON."
+	description := "Takes a task_id parameter identifying the task"
+	schema := []byte(`{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]}`)
+	wire := BuildDevinGetChatMessageRequest(DevinChatRequest{
+		SystemPrompt: prompt,
+		Tools:        []DevinTool{{Name: "task", Description: description, Parameters: schema}},
+	})
+	for _, want := range []string{prompt, description, string(schema)} {
+		if !bytes.Contains(wire, []byte(want)) {
+			t.Errorf("request lost caller content: %q", want)
+		}
+	}
+}
 
-	if strings.Contains(sanitized, "x-anthropic-billing-header") {
-		t.Errorf("sanitized prompt still contains billing header: %s", sanitized)
-	}
-	if strings.Contains(sanitized, "You are Claude Code") {
-		t.Errorf("sanitized prompt still contains Claude Code identity: %s", sanitized)
-	}
-	if strings.Contains(sanitized, "API") && !strings.Contains(sanitized, zeroWidthSpace) {
-		t.Errorf("API was not obfuscated with zero-width space")
+func TestSanitizeDevinSystemPromptOnlyObfuscatesConfiguredWords(t *testing.T) {
+	prompt := "Keep API requirements and return JSON."
+	got := SanitizeDevinSystemPrompt(prompt, BuildSensitiveWordMatcher([]string{"API"}))
+	if strings.ReplaceAll(got, zeroWidthSpace, "") != prompt {
+		t.Fatalf("obfuscation deleted instructions: %q", got)
 	}
 }
 
@@ -175,19 +244,16 @@ func TestBuildDevinGetChatMessageRequest_WithImages(t *testing.T) {
 	}
 
 	temp := 0.0
-	req := BuildDevinGetChatMessageRequest(
-		"token-123",
-		"device-seed-1",
-		"swe-2-max",
-		"assistant instructions",
-		prompts,
-		nil,
-		&temp,
-		4000,
-		"session-1",
-		"cascade-1",
-		nil,
-	)
+	req := BuildDevinGetChatMessageRequest(DevinChatRequest{
+		SessionToken: "token-123",
+		DeviceSeed:   "device-seed-1",
+		ChatModelUID: "swe-2-max",
+		SystemPrompt: "assistant instructions",
+		Prompts:      prompts,
+		Completion:   DevinCompletionConfig{Temperature: &temp, MaxTokens: 4000},
+		SessionID:    "session-1",
+		CascadeID:    "cascade-1",
+	})
 
 	if len(req) == 0 {
 		t.Fatal("encoded request with images is empty")
@@ -204,12 +270,14 @@ func TestBuildDevinGetChatMessageRequest_WithImages(t *testing.T) {
 
 func TestParseDevinFrame(t *testing.T) {
 	// Synthesize a response frame containing:
-	// #1 output_id, #3 delta_text, #9 delta_thinking, #10 delta_signature, #21 delta_signature_type
+	// #1 message_id, #3 delta_text, #9 delta_thinking, #10 delta_signature, #15 output_id, #17 request_id, #21 delta_signature_type
 	var payload []byte
-	payload = appendFieldBytes(payload, 1, []byte("bot-uuid-123"))
+	payload = appendFieldBytes(payload, 1, []byte("message-uuid-123"))
 	payload = appendFieldBytes(payload, 3, []byte("Hello world"))
 	payload = appendFieldBytes(payload, 9, []byte("Let me think..."))
 	payload = appendFieldBytes(payload, 10, []byte("CAQS-signature-bytes"))
+	payload = appendFieldBytes(payload, 15, []byte("output-uuid-123"))
+	payload = appendFieldBytes(payload, 17, []byte("request-uuid-123"))
 	payload = appendFieldBytes(payload, 21, []byte("anthropic"))
 
 	res, err := ParseDevinFrame(payload)
@@ -217,8 +285,14 @@ func TestParseDevinFrame(t *testing.T) {
 		t.Fatalf("ParseDevinFrame failed: %v", err)
 	}
 
-	if res.OutputID != "bot-uuid-123" {
-		t.Errorf("OutputID = %q, want bot-uuid-123", res.OutputID)
+	if res.MessageID != "message-uuid-123" {
+		t.Errorf("MessageID = %q, want message-uuid-123", res.MessageID)
+	}
+	if res.OutputID != "output-uuid-123" {
+		t.Errorf("OutputID = %q, want output-uuid-123", res.OutputID)
+	}
+	if res.RequestID != "request-uuid-123" {
+		t.Errorf("RequestID = %q, want request-uuid-123", res.RequestID)
 	}
 	if res.ContentText != "Hello world" {
 		t.Errorf("ContentText = %q, want 'Hello world'", res.ContentText)
@@ -333,6 +407,81 @@ func appendVarint(dst []byte, v uint64) []byte {
 	return dst
 }
 
+func protoBytesFields(t *testing.T, data []byte, field protowire.Number) [][]byte {
+	t.Helper()
+	var values [][]byte
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			t.Fatalf("consume tag: %v", protowire.ParseError(n))
+		}
+		data = data[n:]
+		if num == field && typ == protowire.BytesType {
+			value, m := protowire.ConsumeBytes(data)
+			if m < 0 {
+				t.Fatalf("consume field %d: %v", field, protowire.ParseError(m))
+			}
+			values = append(values, value)
+			data = data[m:]
+			continue
+		}
+		m := protowire.ConsumeFieldValue(num, typ, data)
+		if m < 0 {
+			t.Fatalf("skip field %d: %v", num, protowire.ParseError(m))
+		}
+		data = data[m:]
+	}
+	return values
+}
+
+func protoVarintField(t *testing.T, data []byte, field protowire.Number) uint64 {
+	t.Helper()
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			t.Fatalf("consume tag: %v", protowire.ParseError(n))
+		}
+		data = data[n:]
+		if num == field && typ == protowire.VarintType {
+			value, m := protowire.ConsumeVarint(data)
+			if m < 0 {
+				t.Fatalf("consume field %d: %v", field, protowire.ParseError(m))
+			}
+			return value
+		}
+		m := protowire.ConsumeFieldValue(num, typ, data)
+		if m < 0 {
+			t.Fatalf("skip field %d: %v", num, protowire.ParseError(m))
+		}
+		data = data[m:]
+	}
+	return 0
+}
+
+func protoFixed64Field(t *testing.T, data []byte, field protowire.Number) uint64 {
+	t.Helper()
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			t.Fatalf("consume tag: %v", protowire.ParseError(n))
+		}
+		data = data[n:]
+		if num == field && typ == protowire.Fixed64Type {
+			value, m := protowire.ConsumeFixed64(data)
+			if m < 0 {
+				t.Fatalf("consume field %d: %v", field, protowire.ParseError(m))
+			}
+			return value
+		}
+		m := protowire.ConsumeFieldValue(num, typ, data)
+		if m < 0 {
+			t.Fatalf("skip field %d: %v", num, protowire.ParseError(m))
+		}
+		data = data[m:]
+	}
+	return 0
+}
+
 func TestBuildDevinUpstreamLogBody(t *testing.T) {
 	interactions := []byte(`{"model":"devin/swe-2","input":[{"type":"user_input","content":[{"type":"text","text":"hello"}]}]}`)
 	prompts := []DevinPrompt{
@@ -444,7 +593,7 @@ func TestBuildDevinGetChatMessageRequest_Field15TurnIndex(t *testing.T) {
 	promptsTurn0 := []DevinPrompt{
 		{MessageID: "u1", Source: 1, Content: "hello"},
 	}
-	req0 := BuildDevinGetChatMessageRequest("tok", "seed", "swe-2-high", "", promptsTurn0, nil, nil, 1000, sessID0, "casc-turn0", nil)
+	req0 := BuildDevinGetChatMessageRequest(DevinChatRequest{SessionToken: "tok", DeviceSeed: "seed", ChatModelUID: "swe-2-high", Prompts: promptsTurn0, Completion: DevinCompletionConfig{MaxTokens: 1000}, SessionID: sessID0, CascadeID: "casc-turn0"})
 	gotSess0, f15Sub0 := extractField15Subfields(t, req0)
 	if gotSess0 != sessID0 {
 		t.Errorf("Field 1 sessionID = %q, want %q", gotSess0, sessID0)
@@ -468,7 +617,7 @@ func TestBuildDevinGetChatMessageRequest_Field15TurnIndex(t *testing.T) {
 		{MessageID: "a1", Source: 2, Content: "calling tool"},
 		{MessageID: "t1", Source: 4, Content: "file content", ToolCallID: "call_1"},
 	}
-	reqTool := BuildDevinGetChatMessageRequest("tok", "seed", "swe-2-high", "", promptsTool, nil, nil, 1000, sessIDTool, "casc-tool", nil)
+	reqTool := BuildDevinGetChatMessageRequest(DevinChatRequest{SessionToken: "tok", DeviceSeed: "seed", ChatModelUID: "swe-2-high", Prompts: promptsTool, Completion: DevinCompletionConfig{MaxTokens: 1000}, SessionID: sessIDTool, CascadeID: "casc-tool"})
 	_, f15SubTool := extractField15Subfields(t, reqTool)
 	if _, hasF4 := f15SubTool[4]; hasF4 {
 		t.Errorf("Field 4 should be omitted on tool result continuation, got %v", f15SubTool[4])
@@ -484,45 +633,24 @@ func TestBuildDevinGetChatMessageRequest_Field15SequentialCounter(t *testing.T) 
 	}
 
 	// Request 1: fresh session -> turnIndex 0 (omitted from wire)
-	req1 := BuildDevinGetChatMessageRequest("tok", "seed", "swe-2-high", "", prompts, nil, nil, 1000, sessionID, "casc-1", nil)
+	req1 := BuildDevinGetChatMessageRequest(DevinChatRequest{SessionToken: "tok", DeviceSeed: "seed", ChatModelUID: "swe-2-high", Prompts: prompts, Completion: DevinCompletionConfig{MaxTokens: 1000}, SessionID: sessionID, CascadeID: "casc-1"})
 	_, sub1 := extractField15Subfields(t, req1)
 	if _, hasF2 := sub1[2]; hasF2 {
 		t.Errorf("Request 1 in fresh session should omit 15.2, got %v", sub1[2])
 	}
 
 	// Request 2: turnIndex 1
-	req2 := BuildDevinGetChatMessageRequest("tok", "seed", "swe-2-high", "", prompts, nil, nil, 1000, sessionID, "casc-1", nil)
+	req2 := BuildDevinGetChatMessageRequest(DevinChatRequest{SessionToken: "tok", DeviceSeed: "seed", ChatModelUID: "swe-2-high", Prompts: prompts, Completion: DevinCompletionConfig{MaxTokens: 1000}, SessionID: sessionID, CascadeID: "casc-1"})
 	_, sub2 := extractField15Subfields(t, req2)
 	if sub2[2] != 1 {
 		t.Errorf("Request 2 should have 15.2 = 1, got %v", sub2[2])
 	}
 
 	// Request 3: turnIndex 2
-	req3 := BuildDevinGetChatMessageRequest("tok", "seed", "swe-2-high", "", prompts, nil, nil, 1000, sessionID, "casc-1", nil)
+	req3 := BuildDevinGetChatMessageRequest(DevinChatRequest{SessionToken: "tok", DeviceSeed: "seed", ChatModelUID: "swe-2-high", Prompts: prompts, Completion: DevinCompletionConfig{MaxTokens: 1000}, SessionID: sessionID, CascadeID: "casc-1"})
 	_, sub3 := extractField15Subfields(t, req3)
 	if sub3[2] != 2 {
 		t.Errorf("Request 3 should have 15.2 = 2, got %v", sub3[2])
-	}
-}
-
-func TestGenerateDevinDeviceFingerprint_RandomWhenEmptySeed(t *testing.T) {
-	fp1 := GenerateDevinDeviceFingerprint("")
-	fp2 := GenerateDevinDeviceFingerprint("")
-	if len(fp1) != DevinFingerprintHexLen {
-		t.Fatalf("fp1 len = %d, want %d", len(fp1), DevinFingerprintHexLen)
-	}
-	if len(fp2) != DevinFingerprintHexLen {
-		t.Fatalf("fp2 len = %d, want %d", len(fp2), DevinFingerprintHexLen)
-	}
-	if fp1 == fp2 {
-		t.Fatalf("fingerprints without explicit seed must be unique per call: %q == %q", fp1, fp2)
-	}
-
-	// With explicit seed, it must be deterministic
-	seeded1 := GenerateDevinDeviceFingerprint("my-stable-seed")
-	seeded2 := GenerateDevinDeviceFingerprint("my-stable-seed")
-	if seeded1 != seeded2 {
-		t.Fatalf("seeded fingerprints must be identical: %q != %q", seeded1, seeded2)
 	}
 }
 
@@ -642,24 +770,27 @@ func TestParseDevinUsageField_HeadersAndField4(t *testing.T) {
 		t.Fatal("expected non-nil usage")
 	}
 
-	// 3 + 58 = 61
-	if usage.PromptTokens != 61 {
-		t.Errorf("PromptTokens = %d, want 61 (3 turn + 58 context)", usage.PromptTokens)
+	// Field 2 is input and field 4 is cache-write usage.
+	if usage.InputTokens != 3 {
+		t.Errorf("InputTokens = %d, want 3", usage.InputTokens)
 	}
-	if usage.CompletionTokens != 39 {
-		t.Errorf("CompletionTokens = %d, want 39", usage.CompletionTokens)
+	if usage.OutputTokens != 39 {
+		t.Errorf("OutputTokens = %d, want 39", usage.OutputTokens)
 	}
-	if usage.CachedTokens != 19179 {
-		t.Errorf("CachedTokens = %d, want 19179", usage.CachedTokens)
+	if usage.CacheWriteTokens != 58 {
+		t.Errorf("CacheWriteTokens = %d, want 58", usage.CacheWriteTokens)
 	}
-	if usage.StatusCode != 66 {
-		t.Errorf("StatusCode = %d, want 66", usage.StatusCode)
+	if usage.CacheReadTokens != 19179 {
+		t.Errorf("CacheReadTokens = %d, want 19179", usage.CacheReadTokens)
+	}
+	if usage.APIProvider != 66 {
+		t.Errorf("APIProvider = %d, want 66", usage.APIProvider)
 	}
 	if usage.RequestID != "req_5bb00ad48ae048119e3420bddf36257f" {
 		t.Errorf("RequestID = %q, want clean request-id", usage.RequestID)
 	}
-	if usage.ModelName != "gpt-5-6-luna-low" {
-		t.Errorf("ModelName = %q, want gpt-5-6-luna-low", usage.ModelName)
+	if usage.ModelUID != "gpt-5-6-luna-low" {
+		t.Errorf("ModelUID = %q, want gpt-5-6-luna-low", usage.ModelUID)
 	}
 	if usage.Headers["openai-processing-ms"] != "419" {
 		t.Errorf("header processing-ms = %q, want 419", usage.Headers["openai-processing-ms"])
@@ -696,14 +827,14 @@ func TestParseDevinUsageField_AnthropicRequestId(t *testing.T) {
 	if usage.RequestID != "req_011Cf1JivhJrXDq9ycq7cEtH" {
 		t.Errorf("RequestID = %q, want req_011Cf1JivhJrXDq9ycq7cEtH", usage.RequestID)
 	}
-	if usage.PromptTokens != 4 {
-		t.Errorf("PromptTokens = %d, want 4", usage.PromptTokens)
+	if usage.InputTokens != 4 {
+		t.Errorf("InputTokens = %d, want 4", usage.InputTokens)
 	}
-	if usage.CompletionTokens != 109 {
-		t.Errorf("CompletionTokens = %d, want 109", usage.CompletionTokens)
+	if usage.OutputTokens != 109 {
+		t.Errorf("OutputTokens = %d, want 109", usage.OutputTokens)
 	}
-	if usage.CachedTokens != 577 {
-		t.Errorf("CachedTokens = %d, want 577", usage.CachedTokens)
+	if usage.CacheReadTokens != 577 {
+		t.Errorf("CacheReadTokens = %d, want 577", usage.CacheReadTokens)
 	}
 }
 
